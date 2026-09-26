@@ -4,8 +4,9 @@
 const ctx=self as unknown as DedicatedWorkerGlobalScope; let stopped=false;
 type V={x:number;y:number;z:number};
 const R=3_389_500,SEED=1337;
-// Output grid is intentionally kept at the requested 33 x 33 source resolution.
-const SOURCE_SPACING_METERS=2.29, SOURCE_DEPTH_METERS=73.1;
+// Output grid per chunk (vertices per edge) and per-chunk physical cell size
+// are supplied by the UI via postMessage (res / chunks); constants below are
+// planetary only.
 const norm=(p:V)=>{const l=Math.hypot(p.x,p.y,p.z)||1;return{x:p.x/l,y:p.y/l,z:p.z/l}},dist=(a:V,b:V)=>Math.hypot(a.x-b.x,a.y-b.y,a.z-b.z),dot=(a:V,b:V)=>a.x*b.x+a.y*b.y+a.z*b.z;
 function faceDir(face:number,u:number,v:number):V{let p:V;if(face===0)p={x:1,y:v,z:-u};else if(face===1)p={x:-1,y:v,z:u};else if(face===2)p={x:u,y:1,z:-v};else if(face===3)p={x:u,y:-1,z:v};else if(face===4)p={x:u,y:v,z:1};else p={x:-u,y:v,z:-1};const{x,y,z}=p,x2=x*x,y2=y*y,z2=z*z;return norm({x:x*Math.sqrt(1-y2/2-z2/2+y2*z2/3),y:y*Math.sqrt(1-z2/2-x2/2+z2*x2/3),z:z*Math.sqrt(1-x2/2-y2/2+x2*y2/3)})}
 function hash3(x:number,y:number,z:number,seed:number){let h=(x|0)*374761393+(y|0)*668265263+(z|0)*2147483647+(seed|0)*3266489917;h=(h^(h>>>13))*1274126177;h^=h>>>16;return((h>>>0)%1_000_000)/1_000_000}
