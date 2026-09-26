@@ -107,6 +107,43 @@ function Globe({ chunks, nPerFace, onClose }: { chunks: Chunk[]; nPerFace: numbe
   const chunksRef = useRef<Chunk[]>(chunks);
   chunksRef.current = chunks;
 
+  const generatingChunk = useMemo(() => chunks.find(c => c.status === 'generating') ?? null, [chunks]);
+  const done = useMemo(() => chunks.filter(c => c.status === 'complete').length, [chunks]);
+  const total = chunks.length;
+  const pct = total ? Math.round((done / total) * 100) : 0;
+  const totalBytes = useMemo(() => chunks.reduce((a, c) => a + c.size, 0), [chunks]);
+
+  const targetRotRef = useRef<{ x: number; y: number } | null>(null);
+  const isDraggingRef = useRef(false);
+  const autoFollowRef = useRef(true);
+  const resumeTimeoutRef = useRef<number | null>(null);
+
+  // Update target rotation when generating chunk changes
+  useEffect(() => {
+    if (!generatingChunk) {
+      targetRotRef.current = null;
+      return;
+    }
+    const N = nPerFace;
+    if (!Number.isFinite(N) || N <= 0) return;
+    const u = -1 + (2 * (generatingChunk.x + 0.5)) / N;
+    const v = -1 + (2 * (generatingChunk.y + 0.5)) / N;
+    const dir = faceDirVec(generatingChunk.face, u, v);
+    const lat = Math.asin(Math.max(-1, Math.min(1, dir.y)));
+    const lon = Math.atan2(dir.z, dir.x);
+    const targetYRaw = lon - Math.PI / 2;
+    const targetXRaw = lat;
+    const targetX = Math.max(-1.2, Math.min(1.2, targetXRaw));
+    if (groupRef.current) {
+      const curY = groupRef.current.rotation.y;
+      let deltaY = targetYRaw - curY;
+      deltaY = Math.atan2(Math.sin(deltaY), Math.cos(deltaY));
+      targetRotRef.current = { x: targetX, y: curY + deltaY };
+    } else {
+      targetRotRef.current = { x: targetX, y: targetYRaw };
+    }
+  }, [generatingChunk, nPerFace]);
+
   // init three.js once
   useEffect(() => {
     if (!mount.current) return;
@@ -182,24 +219,39 @@ function Globe({ chunks, nPerFace, onClose }: { chunks: Chunk[]; nPerFace: numbe
     dl.position.set(3, 2, 4);
     scene.add(dl);
 
-    let drag = false, lx = 0, ly = 0;
-    let autoRot = true;
-    renderer.domElement.onpointerdown = e => {
-      drag = true; autoRot = false;
+    let lx = 0, ly = 0;
+    const onPointerDown = (e: PointerEvent) => {
+      isDraggingRef.current = true;
+      autoFollowRef.current = false;
+      if (resumeTimeoutRef.current) {
+        window.clearTimeout(resumeTimeoutRef.current);
+        resumeTimeoutRef.current = null;
+      }
       lx = e.clientX; ly = e.clientY;
-      renderer.domElement.setPointerCapture(e.pointerId);
+      (e.target as Element).setPointerCapture?.(e.pointerId);
     };
-    renderer.domElement.onpointermove = e => {
-      if (drag && groupRef.current) {
+    const onPointerMove = (e: PointerEvent) => {
+      if (isDraggingRef.current && groupRef.current) {
         groupRef.current.rotation.y += (e.clientX - lx) * 0.008;
         groupRef.current.rotation.x += (e.clientY - ly) * 0.008;
         groupRef.current.rotation.x = Math.max(-1.2, Math.min(1.2, groupRef.current.rotation.x));
         lx = e.clientX; ly = e.clientY;
       }
     };
-    const stopDrag = () => { drag = false; setTimeout(() => { autoRot = true; }, 1200); };
-    renderer.domElement.onpointerup = stopDrag;
-    renderer.domElement.onpointerleave = stopDrag;
+    const onPointerUp = () => {
+      if (isDraggingRef.current) {
+        isDraggingRef.current = false;
+        if (resumeTimeoutRef.current) window.clearTimeout(resumeTimeoutRef.current);
+        resumeTimeoutRef.current = window.setTimeout(() => {
+          autoFollowRef.current = true;
+          resumeTimeoutRef.current = null;
+        }, 2500);
+      }
+    };
+    renderer.domElement.addEventListener('pointerdown', onPointerDown as any);
+    window.addEventListener('pointermove', onPointerMove as any);
+    window.addEventListener('pointerup', onPointerUp);
+    (window as any).addEventListener('pointerleave', onPointerUp);
 
     const onResize = () => {
       if (!mountEl || !cameraRef.current || !rendererRef.current) return;
@@ -214,8 +266,23 @@ function Globe({ chunks, nPerFace, onClose }: { chunks: Chunk[]; nPerFace: numbe
 
     function loop() {
       animRef.current = requestAnimationFrame(loop);
-      if (groupRef.current && autoRot && !drag) {
-        groupRef.current.rotation.y += 0.0015;
+      if (groupRef.current && !isDraggingRef.current && autoFollowRef.current) {
+        if (targetRotRef.current) {
+          const cur = groupRef.current.rotation;
+          const tgt = targetRotRef.current;
+          let dyRaw = tgt.y - cur.y;
+          dyRaw = Math.atan2(Math.sin(dyRaw), Math.cos(dyRaw));
+          const dy = Math.abs(dyRaw);
+          const lerp = dy > 0.8 ? 0.018 : dy > 0.3 ? 0.028 : 0.045;
+          cur.y += dyRaw * lerp;
+          cur.x += (tgt.x - cur.x) * lerp;
+          if (Math.abs(tgt.y - cur.y) < 0.001 && Math.abs(tgt.x - cur.x) < 0.001) {
+            cur.y = tgt.y;
+            cur.x = tgt.x;
+          }
+        } else {
+          groupRef.current.rotation.y += 0.0015;
+        }
       }
       // pulsate generating chunks
       if (geoRef.current && chunksRef.current.length) {
@@ -243,6 +310,11 @@ function Globe({ chunks, nPerFace, onClose }: { chunks: Chunk[]; nPerFace: numbe
     return () => {
       cancelAnimationFrame(animRef.current);
       ro.disconnect();
+      renderer.domElement.removeEventListener('pointerdown', onPointerDown as any);
+      window.removeEventListener('pointermove', onPointerMove as any);
+      window.removeEventListener('pointerup', onPointerUp);
+      (window as any).removeEventListener('pointerleave', onPointerUp);
+      if (resumeTimeoutRef.current) window.clearTimeout(resumeTimeoutRef.current);
       renderer.dispose();
       geo.dispose();
       mat.dispose();
@@ -400,6 +472,22 @@ function Globe({ chunks, nPerFace, onClose }: { chunks: Chunk[]; nPerFace: numbe
         <button onClick={onClose}><X /></button>
       </div>
       <div ref={mount} className="globeCanvas" />
+      {total > 0 && (
+        <div className="globeProgress">
+          <div className="globeProgressTop">
+            <span>{generatingChunk ? `GENERATING ${generatingChunk.id}` : done === total && total > 0 ? 'COMPLETE' : 'IDLE'} · {done} / {total} CHUNKS</span>
+            <b>{pct}%</b>
+          </div>
+          <div className="bar"><i style={{ width: `${pct}%` }} /></div>
+          <div className="globeProgressMeta">
+            {generatingChunk ? (
+              <>Chunk {generatingChunk.id} — {Math.round(generatingChunk.progress * 100)}% · Tile {generatingChunk.x + 1},{generatingChunk.y + 1} Face {faces[generatingChunk.face]} · {formatBytes(totalBytes)} total</>
+            ) : (
+              <>{formatBytes(totalBytes)} generated · {errors > 0 ? `${errors} error${errors === 1 ? '' : 's'}` : 'no errors'} · {pct === 100 && total > 0 ? 'All chunks complete' : 'Waiting for next chunk'}</>
+            )}
+          </div>
+        </div>
+      )}
       <div className="globeLegend">
         <span style={{ display: 'inline-flex', gap: 14, alignItems: 'center', flexWrap: 'wrap' }}>
           <b>{complete}</b> / {chunks.length} chunks generated
