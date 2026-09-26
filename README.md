@@ -1,6 +1,6 @@
 # Ares Foundry — browser Mars terrain generator
 
-A responsive, local-first terrain generation dashboard. Terrain tiles are generated in a Web Worker and exported as compact `.mars` binaries containing a header, Float32 elevation grid, and material map.
+A responsive, local-first terrain generation dashboard. Terrain tiles are generated in a Web Worker at 33 × 33 vertices, using 2.29 m source spacing and a 73.1 m source depth and exported as compact `.mars` binaries containing a header, Float32 elevation grid, and material map.
 
 ## Run
 
