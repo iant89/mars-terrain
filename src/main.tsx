@@ -2,12 +2,14 @@ import React, { useEffect, useMemo, useRef, useState, useCallback } from 'react'
 import { createRoot } from 'react-dom/client';
 import { fromArrayBuffer } from 'geotiff';
 import {
-  FileImage, Globe2, Pause, Play, Square, RefreshCw, Download,
+  FileImage, Globe2, Pause, Play, Square, RefreshCw, Download, Eye, Mountain,
   CheckCircle2, Clock3, AlertTriangle, X, Database, HardDrive, Layers3, Settings2, AlertOctagon,
   SignalLow, SignalMedium, SignalHigh,
 } from 'lucide-react';
 import * as THREE from 'three';
 import { Chunk } from './types';
+import { TerrainViewer } from './renderer';
+import { TileRef } from './terrain';
 import {
   PRESETS, deriveConfig, formatBytes, formatMeters, fmt, Config, PRACTICAL_CHUNK_LIMIT,
 } from './config';
@@ -19,6 +21,10 @@ import { planRegion, RegionSpec } from './region';
 import './style.css';
 
 const faces = ['+X', '−X', '+Y', '−Y', '+Z', '−Z'];
+
+// The renderer is memoized: its props are stable, so the progress updates that
+// re-render App during a run never touch it (it polls the queue itself).
+const TerrainView = React.memo(TerrainViewer);
 
 // The queue list renders at most this many rows — high-density presets have
 // hundreds of thousands of chunks and would otherwise freeze the tab on DOM
@@ -567,6 +573,20 @@ function App() {
   const [running, setRunning] = useState(false);
   const [paused, setPaused] = useState(false);
   const [globe, setGlobe] = useState(false);
+  // 3D terrain renderer: opened on demand, centred on a tile. The viewer polls
+  // the queue through getChunks, so a running generation never re-renders it.
+  const [viewer, setViewer] = useState<{ focus: TileRef | null } | null>(null);
+  const getChunks = useCallback(() => chunksRef.current, []);
+  const openViewer = useCallback((focus?: TileRef) => {
+    const tile = focus
+      ?? (regionEnabled && regionPlan ? regionPlan.center : null)
+      ?? (() => {
+        const first = chunksRef.current.find(c => c.status === 'complete' && c.heights);
+        return first ? { face: first.face, x: first.x, y: first.y } : null;
+      })();
+    setViewer({ focus: tile });
+  }, [regionEnabled, regionPlan]);
+  const closeViewer = useCallback(() => setViewer(null), []);
   const [configOpen, setConfigOpen] = useState(false);
   const [dem, setDem] = useState<string>('');
   const [pack, setPack] = useState<{ status: 'idle' | 'packing' | 'done'; message: string }>({ status: 'idle', message: '' });
@@ -624,8 +644,12 @@ function App() {
       }
       if (d.type === 'done') {
         const blob: Blob = d.blob;
+        // heights/materials are transferred from the worker and kept for the
+        // 3D renderer; the blob holds its own copy for export.
+        const heights: Float32Array = d.heights;
+        const materials: Uint8Array | undefined = d.materials;
         updateChunks(cs => cs.map(c => c.id === d.id
-          ? { ...c, status: 'complete', progress: 1, size: blob.size, blob, crc: d.crc, heights: d.heights }
+          ? { ...c, status: 'complete', progress: 1, size: blob.size, blob, crc: d.crc, heights, materials }
           : c));
         busy.current = false;
         pumpRef.current(); // continue the queue from the message handler, not an effect
@@ -777,6 +801,13 @@ function App() {
           </button>
           <button className="folder" onClick={() => setConfigOpen(o => !o)} title="Generation settings">
             <Settings2 /><span>Settings</span>
+          </button>
+          <button
+            className="folder"
+            onClick={() => openViewer()}
+            title={done ? 'Open the 3D terrain renderer' : 'Generate chunks first — the renderer shows completed tiles'}
+          >
+            <Mountain /><span>3D view</span>
           </button>
           <button className="globe" onClick={() => setGlobe(true)} aria-label="Open globe"><Globe2 /></button>
         </div>
@@ -974,6 +1005,13 @@ function App() {
                 <b>{c.status === 'complete' ? formatBytes(c.size) : c.status === 'generating' ? `${Math.round(c.progress * 100)}%` : '—'}</b>
                 <span>{c.status}</span>
               </div>
+              {c.status === 'complete' && c.heights && (
+                <button
+                  className="iconBtn"
+                  title="View this chunk in 3D"
+                  onClick={() => openViewer({ face: c.face, x: c.x, y: c.y })}
+                ><Eye /></button>
+              )}
               {c.status === 'complete' && c.blob && (
                 <button className="iconBtn" onClick={() => dl(c)}><Download /></button>
               )}
@@ -997,6 +1035,16 @@ function App() {
       </footer>
 
       {globe && <Globe chunks={chunks} nPerFace={queueNRef.current} onClose={() => setGlobe(false)} />}
+
+      {viewer && (
+        <TerrainView
+          getChunks={getChunks}
+          nPerFace={N}
+          resolution={cfg.resolution}
+          focus={viewer.focus}
+          onClose={closeViewer}
+        />
+      )}
     </main>
   );
 }
