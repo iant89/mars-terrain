@@ -24,3 +24,4 @@
 .packBar svg{width:15px;height:15px;flex-shrink:0;color:#d76b50}
 .packBar .spin{animation:packSpin 1s linear infinite}
 @keyframes packSpin{to{transform:rotate(360deg)}}
+.listMore{padding:16px 22px;font-family:'DM Mono';font-size:10px;letter-spacing:1.1px;color:#817a75;border-top:1px solid #ffffff0c}

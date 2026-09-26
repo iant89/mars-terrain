@@ -18,7 +18,16 @@ import './style.css';
 
 const faces = ['+X', '−X', '+Y', '−Y', '+Z', '−Z'];
 
+// The queue list renders at most this many rows — high-density presets have
+// hundreds of thousands of sectors and would otherwise freeze the tab on DOM
+// creation. Totals stay exact in the status bar and the ZIP export.
+const QUEUE_RENDER_LIMIT = 500;
+
 function makeInitialChunks(N: number): Chunk[] {
+  // Hard guard: never materialize a queue for a preset that isn't runnable
+  // in-browser (theoretical presets would be millions/billions of objects and
+  // would lock up the tab).
+  if (!Number.isFinite(N) || N <= 0 || 6 * N * N > PRACTICAL_CHUNK_LIMIT) return [];
   const out: Chunk[] = [];
   for (let face = 0; face < 6; face++) {
     for (let y = 0; y < N; y++) {
@@ -404,9 +413,11 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (cfg.practical) {
-      sessionRef.current = false;
-      setPack({ status: 'idle', message: '' });
+    sessionRef.current = false;
+    setPack({ status: 'idle', message: '' });
+    // Rebuild only when the queue size actually changed and the preset is
+    // runnable; preset clicks already rebuild via reset(p.nPerFace).
+    if (cfg.practical && prevNRef.current !== N) {
       updateChunks(() => makeInitialChunks(N));
       prevNRef.current = N;
     }
@@ -435,12 +446,17 @@ function App() {
   const total = chunks.reduce((a, c) => a + c.size, 0);
   const pct = chunks.length ? Math.round(done / chunks.length * 100) : 0;
 
-  const reset = useCallback(() => {
+  const reset = useCallback((n?: number) => {
+    // Accept an explicit N (preset clicks pass the *new* preset's nPerFace);
+    // falling back to cfgRef would use the stale previous config when switching
+    // presets and could try to build a theoretical preset's queue.
+    const nextN = typeof n === 'number' ? n : cfgRef.current.nPerFace;
     setRunning(false);
     setPaused(false);
     sessionRef.current = false;
     setPack({ status: 'idle', message: '' });
-    updateChunks(() => makeInitialChunks(cfgRef.current.nPerFace));
+    updateChunks(() => makeInitialChunks(nextN));
+    prevNRef.current = nextN;
   }, [updateChunks]);
 
   async function chooseDem(file: File) {
@@ -534,7 +550,10 @@ function App() {
         entries.push({ name: `${c.id}.mars`, blob, crc32: typeof c.crc === 'number' ? c.crc : await crc32OfBlob(blob) });
       }
       const parts = planZipParts(entries);
-      const base = `mars-terrain-${cfgRef.current.nPerFace}x${cfgRef.current.nPerFace}`;
+      // Name the archive after the queue's actual density (not whatever preset
+      // the picker is currently showing).
+      const queueN = Math.round(Math.sqrt(chunksRef.current.length / 6)) || cfgRef.current.nPerFace;
+      const base = `mars-terrain-${queueN}x${queueN}`;
       const built: { blob: Blob; name: string }[] = [];
       for (let i = 0; i < parts.length; i++) {
         setPack({ status: 'packing', message: `Building ${parts.length > 1 ? `part ${i + 1} of ${parts.length}` : 'archive'}…` });
@@ -597,8 +616,11 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [running, paused]);
 
-  const visible = chunks.filter(c =>
-    tab === 'pending' ? ['pending', 'generating'].includes(c.status) : c.status === tab);
+  // Actively generating sectors first in the Queue view so they stay visible
+  // under the render cap below.
+  const visible = tab === 'pending'
+    ? [...chunks.filter(c => c.status === 'generating'), ...chunks.filter(c => c.status === 'pending')]
+    : chunks.filter(c => c.status === tab);
 
   return (
     <main>
@@ -647,7 +669,7 @@ function App() {
                 <button
                   key={p.id}
                   className={`preset ${active ? 'active' : ''} ${c.practical ? '' : 'theoretical'}`}
-                  onClick={() => { setPresetId(p.id); if (c.practical) reset(); }}
+                  onClick={() => { setPresetId(p.id); if (c.practical) reset(p.nPerFace); }}
                 >
                   <h3>{p.label}</h3>
                   <small>{c.practical ? '' : 'THEORETICAL'}</small>
@@ -700,7 +722,7 @@ function App() {
           <button onClick={() => setPaused(!paused)} disabled={!running}><Pause /> {paused ? 'Paused' : 'Pause'}</button>
           <button onClick={stop} disabled={!running}><Square /> Stop</button>
           {cfg.practical && (
-            <button onClick={reset} title="Reset queue"><RefreshCw /> Reset</button>
+            <button onClick={() => reset()} title="Reset queue"><RefreshCw /> Reset</button>
           )}
           <button
             onClick={() => void exportZip()}
@@ -743,7 +765,9 @@ function App() {
             </div>
           ) : visible.length === 0 ? (
             <div className="empty">No sectors in this view.</div>
-          ) : visible.map(c => (
+          ) : (
+            <>
+              {visible.slice(0, QUEUE_RENDER_LIMIT).map(c => (
             <article key={c.id}>
               <div className={`chunkIcon ${c.status}`}>
                 {c.status === 'complete' ? <CheckCircle2 /> :
@@ -767,7 +791,14 @@ function App() {
                 <button className="iconBtn" onClick={() => retry(c.id)}><RefreshCw /></button>
               )}
             </article>
-          ))}
+              ))}
+              {visible.length > QUEUE_RENDER_LIMIT && (
+                <div className="listMore">
+                  Showing {fmt(QUEUE_RENDER_LIMIT)} of {fmt(visible.length)} sectors in this view · all of them are packaged by Download ZIP
+                </div>
+              )}
+            </>
+          )}
         </div>
       </section>
 
