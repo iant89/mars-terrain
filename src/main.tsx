@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState, useCallback } from 'react'
 import { createRoot } from 'react-dom/client';
 import { fromArrayBuffer } from 'geotiff';
 import {
-  FileImage, Globe2, Pause, Play, Square, RefreshCw, FolderOpen, Download,
+  FileImage, Globe2, Pause, Play, Square, RefreshCw, Download,
   CheckCircle2, Clock3, AlertTriangle, X, Database, HardDrive, Layers3, Settings2, AlertOctagon,
 } from 'lucide-react';
 import * as THREE from 'three';
@@ -10,11 +10,47 @@ import { Chunk } from './types';
 import {
   PRESETS, deriveConfig, formatBytes, formatMeters, fmt, Config, PRACTICAL_CHUNK_LIMIT,
 } from './config';
+import {
+  ZipEntry, buildZipBlob, planZipParts, zipPartName, crc32OfBlob,
+  ZIP_PART_MAX_FILES, ZIP_PART_MAX_BYTES,
+} from './zip';
+import { planRegion, RegionSpec } from './region';
 import './style.css';
 
 const faces = ['+X', '−X', '+Y', '−Y', '+Z', '−Z'];
 
-function makeInitialChunks(N: number): Chunk[] {
+// The queue list renders at most this many rows — high-density presets have
+// hundreds of thousands of sectors and would otherwise freeze the tab on DOM
+// creation. Totals stay exact in the status bar and the ZIP export.
+const QUEUE_RENDER_LIMIT = 500;
+
+function numFrom(v: string, lo: number, hi: number, int = false): number {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return 0;
+  const c = Math.max(lo, Math.min(hi, n));
+  return int ? Math.round(c) : c;
+}
+
+function makeInitialChunks(N: number, region: RegionSpec | null): Chunk[] {
+  if (!Number.isFinite(N) || N <= 0) return [];
+  if (region) {
+    // Region mode: only the chunks around the starting position exist. This is
+    // what makes even ultra-high-density presets runnable — cost scales with
+    // the region, not the planet.
+    const plan = planRegion(N, region);
+    if (plan.tiles.length === 0 || plan.tiles.length > PRACTICAL_CHUNK_LIMIT) return [];
+    return plan.tiles.map(t => ({
+      id: `F${t.face}-${t.x}-${t.y}`,
+      face: t.face, x: t.x, y: t.y,
+      status: 'pending',
+      size: 0,
+      progress: 0,
+    }));
+  }
+  // Hard guard: never materialize a planet-wide queue for a preset that isn't
+  // runnable in-browser (theoretical presets would be millions/billions of
+  // objects and would lock up the tab).
+  if (6 * N * N > PRACTICAL_CHUNK_LIMIT) return [];
   const out: Chunk[] = [];
   for (let face = 0; face < 6; face++) {
     for (let y = 0; y < N; y++) {
@@ -55,7 +91,7 @@ function faceDirVec(face: number, u: number, v: number): Vec3 {
   });
 }
 
-function Globe({ chunks, onClose }: { chunks: Chunk[]; onClose: () => void }) {
+function Globe({ chunks, nPerFace, onClose }: { chunks: Chunk[]; nPerFace: number; onClose: () => void }) {
   const mount = useRef<HTMLDivElement>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const sceneRef = useRef<THREE.Scene | null>(null);
@@ -222,7 +258,7 @@ function Globe({ chunks, onClose }: { chunks: Chunk[]; onClose: () => void }) {
     if (!geoRef.current || !pointsRef.current || !canvasRef.current || !texRef.current || !globeMeshRef.current) return;
     const count = chunks.length;
     if (count === 0) return;
-    const N = Math.round(Math.sqrt(count / 6));
+    const N = nPerFace;
     if (!Number.isFinite(N) || N <= 0) return;
 
     const positions = new Float32Array(count * 3);
@@ -383,59 +419,93 @@ function App() {
   );
   const N = cfg.nPerFace;
 
-  // Build the chunk list only for practical presets. Unpractical presets produce
-  // so many chunks (millions to billions) that keeping them in React state
-  // would hang the browser; we still expose their derived numbers.
-  const [chunks, setChunks] = useState<Chunk[]>(() => makeInitialChunks(32));
-  const prevNRef = useRef(32);
+  // Build the chunk list only for runnable configurations. Planet-wide queues
+  // for theoretical presets would be millions to billions of objects; region
+  // mode scales with the region, not the planet, so it unlocks even the
+  // highest densities for a local play area.
+  const [chunks, setChunks] = useState<Chunk[]>(() => []);
+
+  // Current chunk list, kept in sync by updateChunks so the worker message
+  // handlers and the generation pump always see up-to-date sector states
+  // without re-rendering.
+  const chunksRef = useRef<Chunk[]>(chunks);
+  const updateChunks = useCallback((fn: (cs: Chunk[]) => Chunk[]) => {
+    const next = fn(chunksRef.current);
+    chunksRef.current = next;
+    setChunks(next);
+  }, []);
+
+  // Region mode (Settings): save only the chunks around a starting position,
+  // discard the rest. Never generated, so the run starts fast and small.
+  const [regionEnabled, setRegionEnabled] = useState(false);
+  const [regionLat, setRegionLat] = useState(0);
+  const [regionLon, setRegionLon] = useState(0);
+  const [regionRadius, setRegionRadius] = useState(6);
+  const [resetNonce, setResetNonce] = useState(0);
+
+  const regionPlan = useMemo(
+    () => (regionEnabled
+      ? planRegion(cfg.nPerFace, { lat: regionLat, lon: regionLon, radiusTiles: regionRadius })
+      : null),
+    [regionEnabled, regionLat, regionLon, regionRadius, cfg.nPerFace],
+  );
+  const runnable = cfg.practical
+    || (regionPlan !== null && regionPlan.sectorCount > 0 && regionPlan.sectorCount <= PRACTICAL_CHUNK_LIMIT);
+
+  // Identity of the current queue definition. The effect below is the only
+  // queue builder and reads the current preset/region values from this render,
+  // so a stale config can never be used to size the queue.
+  const queueKey = runnable
+    ? `${N}|${regionEnabled ? `${regionLat}|${regionLon}|${regionRadius}` : 'planet'}`
+    : 'off';
+  const queueNameRef = useRef('mars-terrain');
+  const queueNRef = useRef(32);
+
   useEffect(() => {
-    if (cfg.practical) {
-      setChunks(makeInitialChunks(N));
-      prevNRef.current = N;
-    }
-  }, [N, cfg.practical]);
+    sessionRef.current = false;
+    setPack({ status: 'idle', message: '' });
+    if (queueKey === 'off') return; // not runnable — keep any previous queue (still downloadable)
+    updateChunks(() => makeInitialChunks(
+      N,
+      regionEnabled ? { lat: regionLat, lon: regionLon, radiusTiles: regionRadius } : null,
+    ));
+    queueNameRef.current = `mars-terrain-${N}x${N}${regionEnabled ? `-region-r${regionRadius}` : ''}`;
+    queueNRef.current = N;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [queueKey, resetNonce, updateChunks]);
 
   const [tab, setTab] = useState<'pending' | 'complete' | 'error'>('pending');
   const [running, setRunning] = useState(false);
   const [paused, setPaused] = useState(false);
   const [globe, setGlobe] = useState(false);
   const [configOpen, setConfigOpen] = useState(false);
-  const [dir, setDir] = useState<FileSystemDirectoryHandle | null>(null);
-  const [dirName, setDirName] = useState<string>('');
   const [dem, setDem] = useState<string>('');
+  const [pack, setPack] = useState<{ status: 'idle' | 'packing' | 'done'; message: string }>({ status: 'idle', message: '' });
   const demInput = useRef<HTMLInputElement>(null);
-  const outputInput = useRef<HTMLInputElement>(null);
   const worker = useRef<Worker | null>(null);
   const busy = useRef(false);
+  const packingRef = useRef(false);
+  const sessionRef = useRef(false); // true while a generation run should auto-package on finish
   const cfgRef = useRef(cfg);
   cfgRef.current = cfg;
+  const runningRef = useRef(running);
+  runningRef.current = running;
+  const pausedRef = useRef(paused);
+  pausedRef.current = paused;
 
   const done = chunks.filter(c => c.status === 'complete').length;
   const total = chunks.reduce((a, c) => a + c.size, 0);
   const pct = chunks.length ? Math.round(done / chunks.length * 100) : 0;
 
   const reset = useCallback(() => {
+    // Clears the run state and bumps the nonce so the queue-build effect
+    // re-runs with the currently selected preset/region.
     setRunning(false);
     setPaused(false);
-    setChunks(makeInitialChunks(cfgRef.current.nPerFace));
+    sessionRef.current = false;
+    setPack({ status: 'idle', message: '' });
+    setResetNonce(x => x + 1);
   }, []);
-
-  async function chooseDir() {
-    if (!('showDirectoryPicker' in window)) { outputInput.current?.click(); return; }
-    try {
-      const d = await (window as any).showDirectoryPicker({ mode: 'readwrite' });
-      setDir(d);
-      setDirName(d.name || 'Directory linked');
-      const names = new Set<string>();
-      for await (const [name] of (d as any).entries()) names.add(name);
-      setChunks(cs => cs.map(c => names.has(`${c.id}.mars`) ? { ...c, status: 'complete', size: 0, progress: 1 } : c));
-    } catch (err: any) {
-      // AbortError = user cancelled - ignore. Otherwise fallback to legacy picker.
-      if (err?.name === 'AbortError') return;
-      console.warn('showDirectoryPicker failed, falling back to legacy picker', err);
-      outputInput.current?.click();
-    }
-  }
 
   async function chooseDem(file: File) {
     try {
@@ -447,22 +517,6 @@ function App() {
     }
   }
 
-  function chooseOutputFiles(files: FileList | null) {
-    if (!files || files.length === 0) return;
-    const fileArr = Array.from(files);
-    const names = new Set(fileArr.map(f => f.name));
-    // Try to infer folder name from webkitRelativePath (e.g. "myFolder/F0-0-0.mars" -> "myFolder")
-    const firstPath = (fileArr[0] as any).webkitRelativePath as string | undefined;
-    if (firstPath && firstPath.includes('/')) {
-      setDirName(firstPath.split('/')[0]);
-    } else {
-      setDirName(`${fileArr.length} files selected`);
-    }
-    const mola = fileArr.find(f => f.name === 'Mars_MGS_MOLA_DEM_mosaic_global_463m.tif')?.name;
-    if (mola) setDem(mola);
-    setChunks(cs => cs.map(c => names.has(`${c.id}.mars`) ? { ...c, status: 'complete', size: 0, progress: 1 } : c));
-  }
-
   useEffect(() => {
     fetch('./Mars_MGS_MOLA_DEM_mosaic_global_463m.tif')
       .then(r => r.ok ? r.blob() : Promise.reject())
@@ -470,61 +524,40 @@ function App() {
       .catch(() => {});
   }, []);
 
+  const pumpRef = useRef<() => void>(() => {});
+
   useEffect(() => {
     worker.current = new Worker(new URL('./terrain.worker.ts', import.meta.url), { type: 'module' });
-    worker.current.onmessage = async e => {
+    worker.current.onmessage = e => {
       const d = e.data;
       if (d.type === 'progress') {
-        setChunks(cs => cs.map(c => c.id === d.id ? { ...c, progress: d.progress } : c));
+        updateChunks(cs => cs.map(c => c.id === d.id ? { ...c, progress: d.progress } : c));
       }
       if (d.type === 'done') {
         const blob: Blob = d.blob;
-        if (dir) {
-          try {
-            const f = await dir.getFileHandle(`${d.id}.mars`, { create: true });
-            const w = await f.createWritable();
-            await w.write(blob);
-            await w.close();
-          } catch {}
-        }
-        setChunks(cs => cs.map(c => c.id === d.id
-          ? { ...c, status: 'complete', progress: 1, size: blob.size, blob, heights: d.heights }
+        updateChunks(cs => cs.map(c => c.id === d.id
+          ? { ...c, status: 'complete', progress: 1, size: blob.size, blob, crc: d.crc, heights: d.heights }
           : c));
         busy.current = false;
+        pumpRef.current(); // continue the queue from the message handler, not an effect
       }
     };
     return () => worker.current?.terminate();
-  }, [dir]);
-
-  useEffect(() => {
-    if (!running || paused || busy.current) return;
-    const next = chunks.find(c => c.status === 'pending' || c.status === 'error');
-    if (!next) { setRunning(false); return; }
-    busy.current = true;
-    setChunks(cs => cs.map(c => c.id === next.id ? { ...c, status: 'generating', error: undefined } : c));
-    worker.current?.postMessage({
-      type: 'generate',
-      id: next.id,
-      face: next.face,
-      cx: next.x,
-      cy: next.y,
-      res: cfg.resolution,
-      chunks: N,
-    });
-  }, [running, paused, chunks, cfg.resolution, N]);
+  }, [updateChunks]);
 
   function stop() {
     setRunning(false);
     setPaused(false);
     worker.current?.postMessage({ type: 'stop' });
     busy.current = false;
-    setChunks(cs => cs.map(c => c.status === 'generating'
+    updateChunks(cs => cs.map(c => c.status === 'generating'
       ? { ...c, status: 'error', progress: 0, error: 'Generation interrupted — no partial file saved' }
       : c));
   }
 
   function retry(id: string) {
-    setChunks(cs => cs.map(c => c.id === id ? { ...c, status: 'pending', progress: 0, error: undefined } : c));
+    sessionRef.current = true;
+    updateChunks(cs => cs.map(c => c.id === id ? { ...c, status: 'pending', progress: 0, error: undefined } : c));
     setRunning(true);
   }
 
@@ -537,14 +570,107 @@ function App() {
     URL.revokeObjectURL(a.href);
   }
 
-  const visible = chunks.filter(c =>
-    tab === 'pending' ? ['pending', 'generating'].includes(c.status) : c.status === tab);
+  function triggerDownload(blob: Blob, name: string) {
+    const a = document.createElement('a');
+    const url = URL.createObjectURL(blob);
+    a.href = url;
+    a.download = name;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  }
+
+  // Package every completed tile into one or more zip archives and hand them
+  // to the browser as downloads. Splits when the file count or overall size
+  // exceeds the per-archive caps (see zip.ts); split parts are named
+  // `<base>_PART-#.zip`. Large archives are composed from the existing tile
+  // blobs without copying their payloads.
+  const exportZip = useCallback(async () => {
+    if (packingRef.current) return;
+    const ready = chunksRef.current.filter(c => c.status === 'complete' && c.blob);
+    if (ready.length === 0) return;
+    packingRef.current = true;
+    try {
+      setPack({ status: 'packing', message: `Packaging ${fmt(ready.length)} sectors…` });
+      await new Promise(r => setTimeout(r, 0));
+      const entries: ZipEntry[] = [];
+      for (const c of ready) {
+        const blob = c.blob!;
+        entries.push({ name: `${c.id}.mars`, blob, crc32: typeof c.crc === 'number' ? c.crc : await crc32OfBlob(blob) });
+      }
+      const parts = planZipParts(entries);
+      // The name recorded when the queue was built — always matches the tiles
+      // being packaged (density + region), whatever preset is shown now.
+      const base = queueNameRef.current;
+      const built: { blob: Blob; name: string }[] = [];
+      for (let i = 0; i < parts.length; i++) {
+        setPack({ status: 'packing', message: `Building ${parts.length > 1 ? `part ${i + 1} of ${parts.length}` : 'archive'}…` });
+        await new Promise(r => setTimeout(r, 0));
+        built.push({ blob: buildZipBlob(parts[i]), name: zipPartName(base, i + 1, parts.length) });
+      }
+      const totalBytes = built.reduce((a, b) => a + b.blob.size, 0);
+      setPack({
+        status: 'done',
+        message: built.length > 1
+          ? `Packaged ${fmt(entries.length)} sectors into ${built.length} parts (${formatBytes(totalBytes)}) · ${built.map(b => b.name).join(' · ')} · downloading…`
+          : `Packaged ${fmt(entries.length)} sectors (${formatBytes(totalBytes)}) · downloading ${built[0].name}…`,
+      });
+      for (const b of built) {
+        triggerDownload(b.blob, b.name);
+        await new Promise(r => setTimeout(r, 750));
+      }
+    } catch (err) {
+      console.error('zip export failed', err);
+      setPack({ status: 'done', message: 'Packaging failed — see console. Completed sectors can still be downloaded individually.' });
+    } finally {
+      packingRef.current = false;
+    }
+  }, []);
+
+  // Generation pump: picks the next sector and hands it to the worker. Called
+  // from the worker's done handler and from the [running, paused] effect below
+  // (start/pause transitions only) — never chained through chunk state, so it
+  // cannot nest updates.
+  const pump = useCallback(() => {
+    const cs = chunksRef.current;
+    if (!runningRef.current || pausedRef.current || busy.current) return;
+    const next = cs.find(c => c.status === 'pending' || c.status === 'error');
+    if (!next) {
+      if (runningRef.current) setRunning(false);
+      // A generation run finished cleanly — package and download automatically.
+      if (sessionRef.current && cs.length > 0 && cs.every(c => c.status === 'complete')) {
+        sessionRef.current = false;
+        void exportZip();
+      }
+      return;
+    }
+    busy.current = true;
+    updateChunks(list => list.map(c => c.id === next.id ? { ...c, status: 'generating', error: undefined } : c));
+    worker.current?.postMessage({
+      type: 'generate',
+      id: next.id,
+      face: next.face,
+      cx: next.x,
+      cy: next.y,
+      res: cfgRef.current.resolution,
+      chunks: cfgRef.current.nPerFace,
+    });
+  }, [updateChunks, exportZip]);
+  pumpRef.current = pump;
+
+  // Wake the pump on start/pause/stop/resume transitions only.
+  useEffect(() => {
+    pumpRef.current();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [running, paused]);
+
+  // Actively generating sectors first in the Queue view so they stay visible
+  // under the render cap below.
+  const visible = tab === 'pending'
+    ? [...chunks.filter(c => c.status === 'generating'), ...chunks.filter(c => c.status === 'pending')]
+    : chunks.filter(c => c.status === tab);
 
   return (
     <main>
-      <input ref={outputInput} type="file" style={{ display: 'none' }} multiple
-        {...({ webkitdirectory: '', directory: '' } as any)}
-        onChange={e => { chooseOutputFiles(e.target.files); if (e.target) e.target.value = ''; }} />
       <input ref={demInput} type="file" hidden accept=".tif,.tiff,image/tiff"
         onChange={e => e.target.files?.[0] && chooseDem(e.target.files[0])} />
 
@@ -557,9 +683,6 @@ function App() {
           </div>
         </div>
         <div className="headActions">
-          <button className="folder" onClick={chooseDir} title={dirName || 'Select output folder'}>
-            <FolderOpen /><span>{dirName || (dir ? 'Directory linked' : 'Select output')}</span>
-          </button>
           <button className="folder" onClick={() => demInput.current?.click()} title="Load MOLA GeoTIFF">
             <FileImage /><span>{dem ? 'MOLA DEM loaded' : 'Load MOLA DEM'}</span>
           </button>
@@ -579,9 +702,11 @@ function App() {
               <p>Choose how many cube-face tiles partition the planet. All downstream constants (vertex spacing, output size, etc.) are derived automatically.</p>
             </div>
             {!cfg.practical && (
-              <div className="configWarn">
-                <AlertOctagon />
-                <span>This preset is not runnable in-browser — totals exceed {formatBytes(PRACTICAL_CHUNK_LIMIT * cfg.bytesPerChunk)}. Values are shown for planning.</span>
+              <div className={regionEnabled ? 'configWarn info' : 'configWarn'}>
+                {regionEnabled ? <Layers3 /> : <AlertOctagon />}
+                <span>{regionEnabled
+                  ? `Planet-wide totals exceed ${formatBytes(PRACTICAL_CHUNK_LIMIT * cfg.bytesPerChunk)}, but with region export on only the chunks around your starting position are generated — so this density is runnable for a local play area.`
+                  : `This preset is not runnable in-browser — totals exceed ${formatBytes(PRACTICAL_CHUNK_LIMIT * cfg.bytesPerChunk)}. Enable region export below to use it for a local play area, or pick a smaller preset.`}</span>
               </div>
             )}
           </div>
@@ -593,10 +718,10 @@ function App() {
                 <button
                   key={p.id}
                   className={`preset ${active ? 'active' : ''} ${c.practical ? '' : 'theoretical'}`}
-                  onClick={() => { setPresetId(p.id); if (c.practical) reset(); }}
+                  onClick={() => { setPresetId(p.id); reset(); }}
                 >
                   <h3>{p.label}</h3>
-                  <small>{c.practical ? '' : 'THEORETICAL'}</small>
+                  <small>{c.practical ? '' : (regionEnabled ? 'REGION ONLY' : 'THEORETICAL')}</small>
                   <p>{p.description}</p>
                   <dl>
                     <div><dt>Total sectors</dt><dd>{fmt(c.totalChunks)}</dd></div>
@@ -607,13 +732,63 @@ function App() {
               );
             })}
           </div>
+
+          <div className="regionSection">
+            <div className="configHead">
+              <div>
+                <span className="eyebrow"><i /> STARTING POSITION</span>
+                <h2>Region export</h2>
+                <p>Save only the chunks around a starting position and discard the rest. Generation starts almost immediately (nearest chunks first) — your engine can build the remaining chunks as the player approaches the outer edge, just before the missing ones would come into view.</p>
+              </div>
+              <button
+                className={`regionToggle ${regionEnabled ? 'on' : ''}`}
+                onClick={() => setRegionEnabled(o => !o)}
+              >
+                {regionEnabled ? <CheckCircle2 /> : <X />}
+                <span>{regionEnabled ? 'Region export ON' : 'Region export OFF'}</span>
+              </button>
+            </div>
+            <div className={`regionForm ${regionEnabled ? '' : 'dimmed'}`}>
+              <label>
+                <span>LAT °</span>
+                <input type="number" min={-90} max={90} step={0.1} value={regionLat} disabled={!regionEnabled}
+                  onChange={e => setRegionLat(numFrom(e.target.value, -90, 90))} />
+              </label>
+              <label>
+                <span>LON °</span>
+                <input type="number" min={-180} max={180} step={0.1} value={regionLon} disabled={!regionEnabled}
+                  onChange={e => setRegionLon(numFrom(e.target.value, -180, 180))} />
+              </label>
+              <label>
+                <span>RADIUS (TILES)</span>
+                <input type="number" min={0} max={256} step={1} value={regionRadius} disabled={!regionEnabled}
+                  onChange={e => setRegionRadius(numFrom(e.target.value, 0, 256, true))} />
+              </label>
+              <div className="regionQuick">
+                <span>QUICK SET</span>
+                <button disabled={!regionEnabled} onClick={() => { setRegionLat(18.65); setRegionLon(-133.8); }}>Olympus Mons</button>
+                <button disabled={!regionEnabled} onClick={() => { setRegionLat(-5.4); setRegionLon(137.8); }}>Gale Crater</button>
+                <button disabled={!regionEnabled} onClick={() => { setRegionLat(18.38); setRegionLon(77.58); }}>Jezero Crater</button>
+                <button disabled={!regionEnabled} onClick={() => { setRegionLat(-14); setRegionLon(-59); }}>Valles Marineris</button>
+              </div>
+            </div>
+            {regionEnabled && regionPlan && (
+              <div className="regionInfo">
+                Center sector <b>F{regionPlan.center.face}-{regionPlan.center.x}-{regionPlan.center.y}</b>
+                {' · '}<b>{fmt(regionPlan.sectorCount)}</b> sectors kept, {fmt(Math.max(0, cfg.totalChunks - regionPlan.sectorCount))} discarded
+                {' · '}≈ <b>{formatBytes(regionPlan.sectorCount * cfg.bytesPerChunk)}</b> total output
+                {' · '}radius ≈ <b>{formatMeters(regionPlan.radiusKm * 1000)}</b>
+                {' · '}nearest sectors generate first
+              </div>
+            )}
+          </div>
         </section>
       )}
 
       <section className="hero">
         <div>
           <span className="eyebrow"><i /> LOCAL GENERATION PIPELINE</span>
-          <h2>Forge the red planet,<br /><em>one sector at a time.</em></h2>
+          <h2>Forge the red planet,<br /><em>one chunk at a time.</em></h2>
           <p>Deterministic cube-sphere terrain informed by NASA MOLA elevation characteristics. Generated entirely on your device.</p>
         </div>
         <div className="orbit">
@@ -637,17 +812,24 @@ function App() {
         <div>
           <button
             className="primary"
-            onClick={() => { setRunning(true); setPaused(false); }}
-            disabled={(running && !paused) || !cfg.practical}
-            title={!cfg.practical ? 'This preset is too large to run in-browser' : ''}
+            onClick={() => { sessionRef.current = true; setRunning(true); setPaused(false); }}
+            disabled={(running && !paused) || !runnable}
+            title={!runnable ? 'This preset is too large to run in-browser — enable region export or pick a smaller preset' : ''}
           >
             <Play /> {done ? 'Resume generation' : 'Begin generation'}
           </button>
           <button onClick={() => setPaused(!paused)} disabled={!running}><Pause /> {paused ? 'Paused' : 'Pause'}</button>
           <button onClick={stop} disabled={!running}><Square /> Stop</button>
-          {cfg.practical && (
-            <button onClick={reset} title="Reset queue"><RefreshCw /> Reset</button>
+          {runnable && (
+            <button onClick={() => reset()} title="Reset queue"><RefreshCw /> Reset</button>
           )}
+          <button
+            onClick={() => void exportZip()}
+            disabled={done === 0 || pack.status === 'packing'}
+            title={done === 0 ? 'Generate sectors first' : 'Package completed sectors into zip file(s) and download them'}
+          >
+            <Download /> {pack.status === 'packing' ? 'Packaging…' : 'Download ZIP'}
+          </button>
         </div>
         <span>
           {cfg.resolution} × {cfg.resolution} vertices per chunk ·
@@ -656,6 +838,13 @@ function App() {
           {' '}MARS binary · preset <b>{cfg.preset.label}</b>
         </span>
       </section>
+
+      {pack.status !== 'idle' && (
+        <div className="packBar">
+          {pack.status === 'packing' ? <RefreshCw className="spin" /> : <CheckCircle2 />}
+          <span>{pack.message}</span>
+        </div>
+      )}
 
       <section className="queue">
         <div className="tabs">
@@ -667,15 +856,17 @@ function App() {
           ))}
         </div>
         <div className="list">
-          {!cfg.practical ? (
+          {!runnable ? (
             <div className="empty">
               <AlertOctagon style={{ width: 32, height: 32, color: '#c95c4b', marginBottom: 12 }} />
               <p>This preset ({cfg.preset.label}) is too large to manage in a browser tab — {fmt(cfg.totalChunks)} sectors would require {formatBytes(cfg.estimatedTotalBytes)} of output.</p>
-              <p>Select a smaller preset or the headless/streaming generator to proceed.</p>
+              <p>Enable region export in Settings to generate just the chunks around a starting position, or select a smaller preset.</p>
             </div>
           ) : visible.length === 0 ? (
             <div className="empty">No sectors in this view.</div>
-          ) : visible.map(c => (
+          ) : (
+            <>
+              {visible.slice(0, QUEUE_RENDER_LIMIT).map(c => (
             <article key={c.id}>
               <div className={`chunkIcon ${c.status}`}>
                 {c.status === 'complete' ? <CheckCircle2 /> :
@@ -699,7 +890,14 @@ function App() {
                 <button className="iconBtn" onClick={() => retry(c.id)}><RefreshCw /></button>
               )}
             </article>
-          ))}
+              ))}
+              {visible.length > QUEUE_RENDER_LIMIT && (
+                <div className="listMore">
+                  Showing {fmt(QUEUE_RENDER_LIMIT)} of {fmt(visible.length)} sectors in this view · all of them are packaged by Download ZIP
+                </div>
+              )}
+            </>
+          )}
         </div>
       </section>
 
@@ -707,7 +905,7 @@ function App() {
         <Database /> NASA MOLA-inspired planetary model <span>•</span> All processing stays local
       </footer>
 
-      {globe && <Globe chunks={chunks} onClose={() => setGlobe(false)} />}
+      {globe && <Globe chunks={chunks} nPerFace={queueNRef.current} onClose={() => setGlobe(false)} />}
     </main>
   );
 }
