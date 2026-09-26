@@ -14,6 +14,7 @@ import {
   ZipEntry, buildZipBlob, planZipParts, zipPartName, crc32OfBlob,
   ZIP_PART_MAX_FILES, ZIP_PART_MAX_BYTES,
 } from './zip';
+import { planRegion, RegionSpec } from './region';
 import './style.css';
 
 const faces = ['+X', '−X', '+Y', '−Y', '+Z', '−Z'];
@@ -23,11 +24,33 @@ const faces = ['+X', '−X', '+Y', '−Y', '+Z', '−Z'];
 // creation. Totals stay exact in the status bar and the ZIP export.
 const QUEUE_RENDER_LIMIT = 500;
 
-function makeInitialChunks(N: number): Chunk[] {
-  // Hard guard: never materialize a queue for a preset that isn't runnable
-  // in-browser (theoretical presets would be millions/billions of objects and
-  // would lock up the tab).
-  if (!Number.isFinite(N) || N <= 0 || 6 * N * N > PRACTICAL_CHUNK_LIMIT) return [];
+function numFrom(v: string, lo: number, hi: number, int = false): number {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return 0;
+  const c = Math.max(lo, Math.min(hi, n));
+  return int ? Math.round(c) : c;
+}
+
+function makeInitialChunks(N: number, region: RegionSpec | null): Chunk[] {
+  if (!Number.isFinite(N) || N <= 0) return [];
+  if (region) {
+    // Region mode: only the chunks around the starting position exist. This is
+    // what makes even ultra-high-density presets runnable — cost scales with
+    // the region, not the planet.
+    const plan = planRegion(N, region);
+    if (plan.tiles.length === 0 || plan.tiles.length > PRACTICAL_CHUNK_LIMIT) return [];
+    return plan.tiles.map(t => ({
+      id: `F${t.face}-${t.x}-${t.y}`,
+      face: t.face, x: t.x, y: t.y,
+      status: 'pending',
+      size: 0,
+      progress: 0,
+    }));
+  }
+  // Hard guard: never materialize a planet-wide queue for a preset that isn't
+  // runnable in-browser (theoretical presets would be millions/billions of
+  // objects and would lock up the tab).
+  if (6 * N * N > PRACTICAL_CHUNK_LIMIT) return [];
   const out: Chunk[] = [];
   for (let face = 0; face < 6; face++) {
     for (let y = 0; y < N; y++) {
@@ -68,7 +91,7 @@ function faceDirVec(face: number, u: number, v: number): Vec3 {
   });
 }
 
-function Globe({ chunks, onClose }: { chunks: Chunk[]; onClose: () => void }) {
+function Globe({ chunks, nPerFace, onClose }: { chunks: Chunk[]; nPerFace: number; onClose: () => void }) {
   const mount = useRef<HTMLDivElement>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const sceneRef = useRef<THREE.Scene | null>(null);
@@ -235,7 +258,7 @@ function Globe({ chunks, onClose }: { chunks: Chunk[]; onClose: () => void }) {
     if (!geoRef.current || !pointsRef.current || !canvasRef.current || !texRef.current || !globeMeshRef.current) return;
     const count = chunks.length;
     if (count === 0) return;
-    const N = Math.round(Math.sqrt(count / 6));
+    const N = nPerFace;
     if (!Number.isFinite(N) || N <= 0) return;
 
     const positions = new Float32Array(count * 3);
@@ -396,11 +419,11 @@ function App() {
   );
   const N = cfg.nPerFace;
 
-  // Build the chunk list only for practical presets. Unpractical presets produce
-  // so many chunks (millions to billions) that keeping them in React state
-  // would hang the browser; we still expose their derived numbers.
-  const [chunks, setChunks] = useState<Chunk[]>(() => makeInitialChunks(32));
-  const prevNRef = useRef(32);
+  // Build the chunk list only for runnable configurations. Planet-wide queues
+  // for theoretical presets would be millions to billions of objects; region
+  // mode scales with the region, not the planet, so it unlocks even the
+  // highest densities for a local play area.
+  const [chunks, setChunks] = useState<Chunk[]>(() => []);
 
   // Current chunk list, kept in sync by updateChunks so the worker message
   // handlers and the generation pump always see up-to-date sector states
@@ -412,16 +435,44 @@ function App() {
     setChunks(next);
   }, []);
 
+  // Region mode (Settings): save only the chunks around a starting position,
+  // discard the rest. Never generated, so the run starts fast and small.
+  const [regionEnabled, setRegionEnabled] = useState(false);
+  const [regionLat, setRegionLat] = useState(0);
+  const [regionLon, setRegionLon] = useState(0);
+  const [regionRadius, setRegionRadius] = useState(6);
+  const [resetNonce, setResetNonce] = useState(0);
+
+  const regionPlan = useMemo(
+    () => (regionEnabled
+      ? planRegion(cfg.nPerFace, { lat: regionLat, lon: regionLon, radiusTiles: regionRadius })
+      : null),
+    [regionEnabled, regionLat, regionLon, regionRadius, cfg.nPerFace],
+  );
+  const runnable = cfg.practical
+    || (regionPlan !== null && regionPlan.sectorCount > 0 && regionPlan.sectorCount <= PRACTICAL_CHUNK_LIMIT);
+
+  // Identity of the current queue definition. The effect below is the only
+  // queue builder and reads the current preset/region values from this render,
+  // so a stale config can never be used to size the queue.
+  const queueKey = runnable
+    ? `${N}|${regionEnabled ? `${regionLat}|${regionLon}|${regionRadius}` : 'planet'}`
+    : 'off';
+  const queueNameRef = useRef('mars-terrain');
+  const queueNRef = useRef(32);
+
   useEffect(() => {
     sessionRef.current = false;
     setPack({ status: 'idle', message: '' });
-    // Rebuild only when the queue size actually changed and the preset is
-    // runnable; preset clicks already rebuild via reset(p.nPerFace).
-    if (cfg.practical && prevNRef.current !== N) {
-      updateChunks(() => makeInitialChunks(N));
-      prevNRef.current = N;
-    }
-  }, [N, cfg.practical, updateChunks]);
+    if (queueKey === 'off') return; // not runnable — keep any previous queue (still downloadable)
+    updateChunks(() => makeInitialChunks(
+      N,
+      regionEnabled ? { lat: regionLat, lon: regionLon, radiusTiles: regionRadius } : null,
+    ));
+    queueNameRef.current = `mars-terrain-${N}x${N}${regionEnabled ? `-region-r${regionRadius}` : ''}`;
+    queueNRef.current = N;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [queueKey, resetNonce, updateChunks]);
 
   const [tab, setTab] = useState<'pending' | 'complete' | 'error'>('pending');
   const [running, setRunning] = useState(false);
@@ -446,18 +497,15 @@ function App() {
   const total = chunks.reduce((a, c) => a + c.size, 0);
   const pct = chunks.length ? Math.round(done / chunks.length * 100) : 0;
 
-  const reset = useCallback((n?: number) => {
-    // Accept an explicit N (preset clicks pass the *new* preset's nPerFace);
-    // falling back to cfgRef would use the stale previous config when switching
-    // presets and could try to build a theoretical preset's queue.
-    const nextN = typeof n === 'number' ? n : cfgRef.current.nPerFace;
+  const reset = useCallback(() => {
+    // Clears the run state and bumps the nonce so the queue-build effect
+    // re-runs with the currently selected preset/region.
     setRunning(false);
     setPaused(false);
     sessionRef.current = false;
     setPack({ status: 'idle', message: '' });
-    updateChunks(() => makeInitialChunks(nextN));
-    prevNRef.current = nextN;
-  }, [updateChunks]);
+    setResetNonce(x => x + 1);
+  }, []);
 
   async function chooseDem(file: File) {
     try {
@@ -550,10 +598,9 @@ function App() {
         entries.push({ name: `${c.id}.mars`, blob, crc32: typeof c.crc === 'number' ? c.crc : await crc32OfBlob(blob) });
       }
       const parts = planZipParts(entries);
-      // Name the archive after the queue's actual density (not whatever preset
-      // the picker is currently showing).
-      const queueN = Math.round(Math.sqrt(chunksRef.current.length / 6)) || cfgRef.current.nPerFace;
-      const base = `mars-terrain-${queueN}x${queueN}`;
+      // The name recorded when the queue was built — always matches the tiles
+      // being packaged (density + region), whatever preset is shown now.
+      const base = queueNameRef.current;
       const built: { blob: Blob; name: string }[] = [];
       for (let i = 0; i < parts.length; i++) {
         setPack({ status: 'packing', message: `Building ${parts.length > 1 ? `part ${i + 1} of ${parts.length}` : 'archive'}…` });
@@ -655,9 +702,11 @@ function App() {
               <p>Choose how many cube-face tiles partition the planet. All downstream constants (vertex spacing, output size, etc.) are derived automatically.</p>
             </div>
             {!cfg.practical && (
-              <div className="configWarn">
-                <AlertOctagon />
-                <span>This preset is not runnable in-browser — totals exceed {formatBytes(PRACTICAL_CHUNK_LIMIT * cfg.bytesPerChunk)}. Values are shown for planning.</span>
+              <div className={regionEnabled ? 'configWarn info' : 'configWarn'}>
+                {regionEnabled ? <Layers3 /> : <AlertOctagon />}
+                <span>{regionEnabled
+                  ? `Planet-wide totals exceed ${formatBytes(PRACTICAL_CHUNK_LIMIT * cfg.bytesPerChunk)}, but with region export on only the chunks around your starting position are generated — so this density is runnable for a local play area.`
+                  : `This preset is not runnable in-browser — totals exceed ${formatBytes(PRACTICAL_CHUNK_LIMIT * cfg.bytesPerChunk)}. Enable region export below to use it for a local play area, or pick a smaller preset.`}</span>
               </div>
             )}
           </div>
@@ -669,10 +718,10 @@ function App() {
                 <button
                   key={p.id}
                   className={`preset ${active ? 'active' : ''} ${c.practical ? '' : 'theoretical'}`}
-                  onClick={() => { setPresetId(p.id); if (c.practical) reset(p.nPerFace); }}
+                  onClick={() => { setPresetId(p.id); reset(); }}
                 >
                   <h3>{p.label}</h3>
-                  <small>{c.practical ? '' : 'THEORETICAL'}</small>
+                  <small>{c.practical ? '' : (regionEnabled ? 'REGION ONLY' : 'THEORETICAL')}</small>
                   <p>{p.description}</p>
                   <dl>
                     <div><dt>Total sectors</dt><dd>{fmt(c.totalChunks)}</dd></div>
@@ -682,6 +731,56 @@ function App() {
                 </button>
               );
             })}
+          </div>
+
+          <div className="regionSection">
+            <div className="configHead">
+              <div>
+                <span className="eyebrow"><i /> STARTING POSITION</span>
+                <h2>Region export</h2>
+                <p>Save only the chunks around a starting position and discard the rest. Generation starts almost immediately (nearest chunks first) — your engine can build the remaining chunks as the player approaches the outer edge, just before the missing ones would come into view.</p>
+              </div>
+              <button
+                className={`regionToggle ${regionEnabled ? 'on' : ''}`}
+                onClick={() => setRegionEnabled(o => !o)}
+              >
+                {regionEnabled ? <CheckCircle2 /> : <X />}
+                <span>{regionEnabled ? 'Region export ON' : 'Region export OFF'}</span>
+              </button>
+            </div>
+            <div className={`regionForm ${regionEnabled ? '' : 'dimmed'}`}>
+              <label>
+                <span>LAT °</span>
+                <input type="number" min={-90} max={90} step={0.1} value={regionLat} disabled={!regionEnabled}
+                  onChange={e => setRegionLat(numFrom(e.target.value, -90, 90))} />
+              </label>
+              <label>
+                <span>LON °</span>
+                <input type="number" min={-180} max={180} step={0.1} value={regionLon} disabled={!regionEnabled}
+                  onChange={e => setRegionLon(numFrom(e.target.value, -180, 180))} />
+              </label>
+              <label>
+                <span>RADIUS (TILES)</span>
+                <input type="number" min={0} max={256} step={1} value={regionRadius} disabled={!regionEnabled}
+                  onChange={e => setRegionRadius(numFrom(e.target.value, 0, 256, true))} />
+              </label>
+              <div className="regionQuick">
+                <span>QUICK SET</span>
+                <button disabled={!regionEnabled} onClick={() => { setRegionLat(18.65); setRegionLon(-133.8); }}>Olympus Mons</button>
+                <button disabled={!regionEnabled} onClick={() => { setRegionLat(-5.4); setRegionLon(137.8); }}>Gale Crater</button>
+                <button disabled={!regionEnabled} onClick={() => { setRegionLat(18.38); setRegionLon(77.58); }}>Jezero Crater</button>
+                <button disabled={!regionEnabled} onClick={() => { setRegionLat(-14); setRegionLon(-59); }}>Valles Marineris</button>
+              </div>
+            </div>
+            {regionEnabled && regionPlan && (
+              <div className="regionInfo">
+                Center sector <b>F{regionPlan.center.face}-{regionPlan.center.x}-{regionPlan.center.y}</b>
+                {' · '}<b>{fmt(regionPlan.sectorCount)}</b> sectors kept, {fmt(Math.max(0, cfg.totalChunks - regionPlan.sectorCount))} discarded
+                {' · '}≈ <b>{formatBytes(regionPlan.sectorCount * cfg.bytesPerChunk)}</b> total output
+                {' · '}radius ≈ <b>{formatMeters(regionPlan.radiusKm * 1000)}</b>
+                {' · '}nearest sectors generate first
+              </div>
+            )}
           </div>
         </section>
       )}
@@ -714,14 +813,14 @@ function App() {
           <button
             className="primary"
             onClick={() => { sessionRef.current = true; setRunning(true); setPaused(false); }}
-            disabled={(running && !paused) || !cfg.practical}
-            title={!cfg.practical ? 'This preset is too large to run in-browser' : ''}
+            disabled={(running && !paused) || !runnable}
+            title={!runnable ? 'This preset is too large to run in-browser — enable region export or pick a smaller preset' : ''}
           >
             <Play /> {done ? 'Resume generation' : 'Begin generation'}
           </button>
           <button onClick={() => setPaused(!paused)} disabled={!running}><Pause /> {paused ? 'Paused' : 'Pause'}</button>
           <button onClick={stop} disabled={!running}><Square /> Stop</button>
-          {cfg.practical && (
+          {runnable && (
             <button onClick={() => reset()} title="Reset queue"><RefreshCw /> Reset</button>
           )}
           <button
@@ -757,11 +856,11 @@ function App() {
           ))}
         </div>
         <div className="list">
-          {!cfg.practical ? (
+          {!runnable ? (
             <div className="empty">
               <AlertOctagon style={{ width: 32, height: 32, color: '#c95c4b', marginBottom: 12 }} />
               <p>This preset ({cfg.preset.label}) is too large to manage in a browser tab — {fmt(cfg.totalChunks)} sectors would require {formatBytes(cfg.estimatedTotalBytes)} of output.</p>
-              <p>Select a smaller preset or the headless/streaming generator to proceed.</p>
+              <p>Enable region export in Settings to generate just the chunks around a starting position, or select a smaller preset.</p>
             </div>
           ) : visible.length === 0 ? (
             <div className="empty">No sectors in this view.</div>
@@ -806,7 +905,7 @@ function App() {
         <Database /> NASA MOLA-inspired planetary model <span>•</span> All processing stays local
       </footer>
 
-      {globe && <Globe chunks={chunks} onClose={() => setGlobe(false)} />}
+      {globe && <Globe chunks={chunks} nPerFace={queueNRef.current} onClose={() => setGlobe(false)} />}
     </main>
   );
 }
