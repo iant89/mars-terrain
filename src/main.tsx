@@ -32,60 +32,330 @@ function makeInitialChunks(N: number): Chunk[] {
   return out;
 }
 
+// --- shared math for cube-sphere mapping (same as worker) ---
+type Vec3 = { x: number; y: number; z: number };
+function normVec(p: Vec3): Vec3 {
+  const l = Math.hypot(p.x, p.y, p.z) || 1;
+  return { x: p.x / l, y: p.y / l, z: p.z / l };
+}
+function faceDirVec(face: number, u: number, v: number): Vec3 {
+  let p: Vec3;
+  if (face === 0) p = { x: 1, y: v, z: -u };
+  else if (face === 1) p = { x: -1, y: v, z: u };
+  else if (face === 2) p = { x: u, y: 1, z: -v };
+  else if (face === 3) p = { x: u, y: -1, z: v };
+  else if (face === 4) p = { x: u, y: v, z: 1 };
+  else p = { x: -u, y: v, z: -1 };
+  const { x, y, z } = p;
+  const x2 = x * x, y2 = y * y, z2 = z * z;
+  return normVec({
+    x: x * Math.sqrt(1 - y2 / 2 - z2 / 2 + (y2 * z2) / 3),
+    y: y * Math.sqrt(1 - z2 / 2 - x2 / 2 + (z2 * x2) / 3),
+    z: z * Math.sqrt(1 - x2 / 2 - y2 / 2 + (x2 * y2) / 3),
+  });
+}
+
 function Globe({ chunks, onClose }: { chunks: Chunk[]; onClose: () => void }) {
   const mount = useRef<HTMLDivElement>(null);
+  const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
+  const sceneRef = useRef<THREE.Scene | null>(null);
+  const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
+  const groupRef = useRef<THREE.Group | null>(null);
+  const globeMeshRef = useRef<THREE.Mesh | null>(null);
+  const pointsRef = useRef<THREE.Points | null>(null);
+  const geoRef = useRef<THREE.BufferGeometry | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const texRef = useRef<THREE.CanvasTexture | null>(null);
+  const animRef = useRef<number>(0);
+  const chunksRef = useRef<Chunk[]>(chunks);
+  chunksRef.current = chunks;
+
+  // init three.js once
   useEffect(() => {
     if (!mount.current) return;
-    const w = mount.current.clientWidth;
-    const h = mount.current.clientHeight;
+    const mountEl = mount.current;
+    const w = mountEl.clientWidth;
+    const h = mountEl.clientHeight;
+
     const scene = new THREE.Scene();
+    sceneRef.current = scene;
     const camera = new THREE.PerspectiveCamera(42, w / h, 0.1, 10);
     camera.position.z = 3.15;
+    cameraRef.current = camera;
+
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
     renderer.setSize(w, h);
     renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
-    mount.current.appendChild(renderer.domElement);
+    rendererRef.current = renderer;
+    mountEl.appendChild(renderer.domElement);
+
     const group = new THREE.Group();
     scene.add(group);
-    const globe = new THREE.Mesh(
-      new THREE.SphereGeometry(1, 96, 64),
-      new THREE.MeshStandardMaterial({ color: 0xa44224, roughness: 0.82, metalness: 0.05, wireframe: false }),
-    );
+    groupRef.current = group;
+
+    // canvas texture for emissive overlay
+    const canvas = document.createElement('canvas');
+    canvas.width = 1024;
+    canvas.height = 512;
+    const ctx2d = canvas.getContext('2d')!;
+    ctx2d.fillStyle = '#000000';
+    ctx2d.fillRect(0, 0, canvas.width, canvas.height);
+    canvasRef.current = canvas;
+
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    texRef.current = tex;
+
+    const globeMat = new THREE.MeshStandardMaterial({
+      color: 0xa44224,
+      roughness: 0.82,
+      metalness: 0.05,
+      emissive: new THREE.Color(0xff6a3d),
+      emissiveMap: tex,
+      emissiveIntensity: 0.0,
+    });
+    const globe = new THREE.Mesh(new THREE.SphereGeometry(1, 96, 64), globeMat);
+    globeMeshRef.current = globe;
     group.add(globe);
-    group.add(new THREE.LineSegments(
-      new THREE.WireframeGeometry(new THREE.SphereGeometry(1.006, 24, 16)),
-      new THREE.LineBasicMaterial({ color: 0xeaa27a, transparent: true, opacity: 0.12 }),
-    ));
+
+    group.add(
+      new THREE.LineSegments(
+        new THREE.WireframeGeometry(new THREE.SphereGeometry(1.006, 24, 16)),
+        new THREE.LineBasicMaterial({ color: 0xeaa27a, transparent: true, opacity: 0.12 }),
+      ),
+    );
+
+    // chunk markers as Points
+    const geo = new THREE.BufferGeometry();
+    geoRef.current = geo;
+    const mat = new THREE.PointsMaterial({
+      size: 0.035,
+      vertexColors: true,
+      sizeAttenuation: true,
+      transparent: true,
+      opacity: 0.95,
+      depthWrite: false,
+    });
+    const points = new THREE.Points(geo, mat);
+    pointsRef.current = points;
+    group.add(points);
+
     scene.add(new THREE.HemisphereLight(0xffd1ad, 0x180c13, 2.5));
     const dl = new THREE.DirectionalLight(0xffab78, 3);
     dl.position.set(3, 2, 4);
     scene.add(dl);
+
     let drag = false, lx = 0, ly = 0;
+    let autoRot = true;
     renderer.domElement.onpointerdown = e => {
-      drag = true; lx = e.clientX; ly = e.clientY;
+      drag = true; autoRot = false;
+      lx = e.clientX; ly = e.clientY;
       renderer.domElement.setPointerCapture(e.pointerId);
     };
     renderer.domElement.onpointermove = e => {
-      if (drag) {
-        group.rotation.y += (e.clientX - lx) * 0.008;
-        group.rotation.x += (e.clientY - ly) * 0.008;
+      if (drag && groupRef.current) {
+        groupRef.current.rotation.y += (e.clientX - lx) * 0.008;
+        groupRef.current.rotation.x += (e.clientY - ly) * 0.008;
+        groupRef.current.rotation.x = Math.max(-1.2, Math.min(1.2, groupRef.current.rotation.x));
         lx = e.clientX; ly = e.clientY;
       }
     };
-    renderer.domElement.onpointerup = () => { drag = false; };
-    let id = 0;
+    const stopDrag = () => { drag = false; setTimeout(() => { autoRot = true; }, 1200); };
+    renderer.domElement.onpointerup = stopDrag;
+    renderer.domElement.onpointerleave = stopDrag;
+
+    const onResize = () => {
+      if (!mountEl || !cameraRef.current || !rendererRef.current) return;
+      const nw = mountEl.clientWidth;
+      const nh = mountEl.clientHeight;
+      cameraRef.current.aspect = nw / nh;
+      cameraRef.current.updateProjectionMatrix();
+      rendererRef.current.setSize(nw, nh);
+    };
+    const ro = new ResizeObserver(onResize);
+    ro.observe(mountEl);
+
     function loop() {
-      id = requestAnimationFrame(loop);
-      if (!drag) group.rotation.y += 0.0015;
-      renderer.render(scene, camera);
+      animRef.current = requestAnimationFrame(loop);
+      if (groupRef.current && autoRot && !drag) {
+        groupRef.current.rotation.y += 0.0015;
+      }
+      // pulsate generating chunks
+      if (geoRef.current && chunksRef.current.length) {
+        const colors = geoRef.current.getAttribute('color') as THREE.BufferAttribute | undefined;
+        if (colors) {
+          const t = Date.now() * 0.004;
+          const pulse = 0.65 + 0.35 * Math.sin(t * 1.7);
+          let needsUpdate = false;
+          for (let i = 0; i < chunksRef.current.length; i++) {
+            const c = chunksRef.current[i];
+            if (c.status === 'generating') {
+              colors.setXYZ(i, 1.0 * pulse, 0.75 * pulse, 0.45 * pulse);
+              needsUpdate = true;
+            }
+          }
+          if (needsUpdate) colors.needsUpdate = true;
+        }
+      }
+      if (rendererRef.current && sceneRef.current && cameraRef.current) {
+        rendererRef.current.render(sceneRef.current, cameraRef.current);
+      }
     }
     loop();
+
     return () => {
-      cancelAnimationFrame(id);
+      cancelAnimationFrame(animRef.current);
+      ro.disconnect();
       renderer.dispose();
-      mount.current?.removeChild(renderer.domElement);
+      geo.dispose();
+      mat.dispose();
+      globeMat.dispose();
+      tex.dispose();
+      if (renderer.domElement.parentElement === mountEl) {
+        mountEl.removeChild(renderer.domElement);
+      }
     };
   }, []);
+
+  // react to chunks changes
+  useEffect(() => {
+    if (!geoRef.current || !pointsRef.current || !canvasRef.current || !texRef.current || !globeMeshRef.current) return;
+    const count = chunks.length;
+    if (count === 0) return;
+    const N = Math.round(Math.sqrt(count / 6));
+    if (!Number.isFinite(N) || N <= 0) return;
+
+    const positions = new Float32Array(count * 3);
+    const colors = new Float32Array(count * 3);
+
+    const MARS_R = 3_389_500;
+    const exaggeration = 14;
+
+    for (let i = 0; i < count; i++) {
+      const c = chunks[i];
+      const u = -1 + (2 * (c.x + 0.5)) / N;
+      const v = -1 + (2 * (c.y + 0.5)) / N;
+      const dir = faceDirVec(c.face, u, v);
+
+      let r = 1.012;
+      if (c.status === 'complete' && c.heights && c.heights.length > 0) {
+        let sum = 0;
+        const h = c.heights;
+        const step = h.length > 200 ? 8 : 1;
+        let sampled = 0;
+        for (let k = 0; k < h.length; k += step) {
+          sum += h[k];
+          sampled++;
+        }
+        const avg = sampled ? sum / sampled : 0;
+        r = 1.008 + (avg / MARS_R) * exaggeration + 0.018;
+        if (r < 1.004) r = 1.004;
+        if (r > 1.18) r = 1.18;
+      } else if (c.status === 'pending') {
+        r = 1.008;
+      } else if (c.status === 'error') {
+        r = 1.01;
+      } else if (c.status === 'generating') {
+        r = 1.016;
+      }
+
+      positions[i * 3] = dir.x * r;
+      positions[i * 3 + 1] = dir.y * r;
+      positions[i * 3 + 2] = dir.z * r;
+
+      let cr, cg, cb;
+      if (c.status === 'complete') {
+        const hasH = c.heights ? 1 : 0;
+        cr = 0.96;
+        cg = hasH ? 0.56 : 0.42;
+        cb = hasH ? 0.28 : 0.22;
+      } else if (c.status === 'generating') {
+        cr = 1.0; cg = 0.78; cb = 0.38;
+      } else if (c.status === 'error') {
+        cr = 0.95; cg = 0.18; cb = 0.18;
+      } else {
+        cr = 0.18; cg = 0.16; cb = 0.15;
+      }
+      colors[i * 3] = cr;
+      colors[i * 3 + 1] = cg;
+      colors[i * 3 + 2] = cb;
+    }
+
+    const geo = geoRef.current;
+    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    geo.computeBoundingSphere();
+
+    const mat = pointsRef.current.material as THREE.PointsMaterial;
+    if (N <= 16) mat.size = 0.045;
+    else if (N <= 32) mat.size = 0.032;
+    else if (N <= 64) mat.size = 0.02;
+    else if (N <= 128) mat.size = 0.012;
+    else mat.size = 0.008;
+
+    // update emissive canvas texture
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d')!;
+    ctx.fillStyle = '#000000';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    const completeCount = chunks.filter(c => c.status === 'complete').length;
+    const generatingCount = chunks.filter(c => c.status === 'generating').length;
+
+    const globeMat = globeMeshRef.current.material as THREE.MeshStandardMaterial;
+    if (completeCount > 0 || generatingCount > 0) {
+      globeMat.emissiveIntensity = Math.min(1.2, 0.15 + (completeCount / count) * 0.9 + (generatingCount / count) * 0.6);
+    } else {
+      globeMat.emissiveIntensity = 0;
+    }
+
+    const drawPending = count <= 20000;
+    const dotSize = N <= 32 ? 4 : N <= 64 ? 3 : 2;
+
+    for (let i = 0; i < count; i++) {
+      const c = chunks[i];
+      if (!drawPending && c.status === 'pending') continue;
+      const u = -1 + (2 * (c.x + 0.5)) / N;
+      const v = -1 + (2 * (c.y + 0.5)) / N;
+      const dir = faceDirVec(c.face, u, v);
+      const lat = Math.asin(Math.max(-1, Math.min(1, dir.y)));
+      const lon = Math.atan2(dir.z, dir.x);
+      const x = ((lon + Math.PI) / (2 * Math.PI)) * canvas.width;
+      const y = ((Math.PI / 2 - lat) / Math.PI) * canvas.height;
+
+      if (c.status === 'complete') {
+        let brightness = 1;
+        if (c.heights) {
+          const h = c.heights;
+          let s = 0;
+          for (let k = 0; k < h.length; k += 16) s += h[k];
+          const avg = s / (h.length / 16);
+          brightness = 0.7 + Math.max(0, Math.min(1, (avg + 2000) / 10000)) * 0.8;
+        }
+        const r = Math.floor(255 * brightness);
+        const g = Math.floor(140 * brightness);
+        const b = Math.floor(70 * brightness);
+        ctx.fillStyle = `rgb(${r},${g},${b})`;
+        ctx.fillRect(x - dotSize / 2, y - dotSize / 2, dotSize, dotSize);
+      } else if (c.status === 'generating') {
+        ctx.fillStyle = '#ffeb8a';
+        ctx.fillRect(x - dotSize, y - dotSize, dotSize * 2, dotSize * 2);
+      } else if (c.status === 'error') {
+        ctx.fillStyle = '#ff3a3a';
+        ctx.fillRect(x - dotSize / 2, y - dotSize / 2, dotSize, dotSize);
+      } else if (drawPending) {
+        ctx.fillStyle = 'rgba(40,30,28,0.9)';
+        ctx.fillRect(x, y, 1, 1);
+      }
+    }
+
+    texRef.current.needsUpdate = true;
+  }, [chunks]);
+
+  const complete = chunks.filter(c => c.status === 'complete').length;
+  const generating = chunks.filter(c => c.status === 'generating').length;
+  const errors = chunks.filter(c => c.status === 'error').length;
+
   return (
     <div className="modal">
       <div className="globeHead">
@@ -94,8 +364,12 @@ function Globe({ chunks, onClose }: { chunks: Chunk[]; onClose: () => void }) {
       </div>
       <div ref={mount} className="globeCanvas" />
       <div className="globeLegend">
-        <b>{chunks.filter(c => c.status === 'complete').length}</b> / {chunks.length} surface sectors generated
-        <span>Drag to explore</span>
+        <span style={{ display: 'inline-flex', gap: 14, alignItems: 'center', flexWrap: 'wrap' }}>
+          <b>{complete}</b> / {chunks.length} sectors generated
+          {generating > 0 && <span style={{ color: '#ffcf7a' }}>● {generating} generating</span>}
+          {errors > 0 && <span style={{ color: '#ff6b6b' }}>● {errors} error</span>}
+          <span style={{ opacity: 0.7 }}>Drag to explore • points = chunk centers • glow = completed terrain</span>
+        </span>
       </div>
     </div>
   );
