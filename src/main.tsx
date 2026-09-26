@@ -4,6 +4,7 @@ import { fromArrayBuffer } from 'geotiff';
 import {
   FileImage, Globe2, Pause, Play, Square, RefreshCw, Download,
   CheckCircle2, Clock3, AlertTriangle, X, Database, HardDrive, Layers3, Settings2, AlertOctagon,
+  SignalLow, SignalMedium, SignalHigh,
 } from 'lucide-react';
 import * as THREE from 'three';
 import { Chunk } from './types';
@@ -20,7 +21,7 @@ import './style.css';
 const faces = ['+X', '−X', '+Y', '−Y', '+Z', '−Z'];
 
 // The queue list renders at most this many rows — high-density presets have
-// hundreds of thousands of sectors and would otherwise freeze the tab on DOM
+// hundreds of thousands of chunks and would otherwise freeze the tab on DOM
 // creation. Totals stay exact in the status bar and the ZIP export.
 const QUEUE_RENDER_LIMIT = 500;
 
@@ -106,6 +107,43 @@ function Globe({ chunks, nPerFace, onClose }: { chunks: Chunk[]; nPerFace: numbe
   const chunksRef = useRef<Chunk[]>(chunks);
   chunksRef.current = chunks;
 
+  const generatingChunk = useMemo(() => chunks.find(c => c.status === 'generating') ?? null, [chunks]);
+  const done = useMemo(() => chunks.filter(c => c.status === 'complete').length, [chunks]);
+  const total = chunks.length;
+  const pct = total ? Math.round((done / total) * 100) : 0;
+  const totalBytes = useMemo(() => chunks.reduce((a, c) => a + c.size, 0), [chunks]);
+
+  const targetRotRef = useRef<{ x: number; y: number } | null>(null);
+  const isDraggingRef = useRef(false);
+  const autoFollowRef = useRef(true);
+  const resumeTimeoutRef = useRef<number | null>(null);
+
+  // Update target rotation when generating chunk changes
+  useEffect(() => {
+    if (!generatingChunk) {
+      targetRotRef.current = null;
+      return;
+    }
+    const N = nPerFace;
+    if (!Number.isFinite(N) || N <= 0) return;
+    const u = -1 + (2 * (generatingChunk.x + 0.5)) / N;
+    const v = -1 + (2 * (generatingChunk.y + 0.5)) / N;
+    const dir = faceDirVec(generatingChunk.face, u, v);
+    const lat = Math.asin(Math.max(-1, Math.min(1, dir.y)));
+    const lon = Math.atan2(dir.z, dir.x);
+    const targetYRaw = lon - Math.PI / 2;
+    const targetXRaw = lat;
+    const targetX = Math.max(-1.2, Math.min(1.2, targetXRaw));
+    if (groupRef.current) {
+      const curY = groupRef.current.rotation.y;
+      let deltaY = targetYRaw - curY;
+      deltaY = Math.atan2(Math.sin(deltaY), Math.cos(deltaY));
+      targetRotRef.current = { x: targetX, y: curY + deltaY };
+    } else {
+      targetRotRef.current = { x: targetX, y: targetYRaw };
+    }
+  }, [generatingChunk, nPerFace]);
+
   // init three.js once
   useEffect(() => {
     if (!mount.current) return;
@@ -181,24 +219,39 @@ function Globe({ chunks, nPerFace, onClose }: { chunks: Chunk[]; nPerFace: numbe
     dl.position.set(3, 2, 4);
     scene.add(dl);
 
-    let drag = false, lx = 0, ly = 0;
-    let autoRot = true;
-    renderer.domElement.onpointerdown = e => {
-      drag = true; autoRot = false;
+    let lx = 0, ly = 0;
+    const onPointerDown = (e: PointerEvent) => {
+      isDraggingRef.current = true;
+      autoFollowRef.current = false;
+      if (resumeTimeoutRef.current) {
+        window.clearTimeout(resumeTimeoutRef.current);
+        resumeTimeoutRef.current = null;
+      }
       lx = e.clientX; ly = e.clientY;
-      renderer.domElement.setPointerCapture(e.pointerId);
+      (e.target as Element).setPointerCapture?.(e.pointerId);
     };
-    renderer.domElement.onpointermove = e => {
-      if (drag && groupRef.current) {
+    const onPointerMove = (e: PointerEvent) => {
+      if (isDraggingRef.current && groupRef.current) {
         groupRef.current.rotation.y += (e.clientX - lx) * 0.008;
         groupRef.current.rotation.x += (e.clientY - ly) * 0.008;
         groupRef.current.rotation.x = Math.max(-1.2, Math.min(1.2, groupRef.current.rotation.x));
         lx = e.clientX; ly = e.clientY;
       }
     };
-    const stopDrag = () => { drag = false; setTimeout(() => { autoRot = true; }, 1200); };
-    renderer.domElement.onpointerup = stopDrag;
-    renderer.domElement.onpointerleave = stopDrag;
+    const onPointerUp = () => {
+      if (isDraggingRef.current) {
+        isDraggingRef.current = false;
+        if (resumeTimeoutRef.current) window.clearTimeout(resumeTimeoutRef.current);
+        resumeTimeoutRef.current = window.setTimeout(() => {
+          autoFollowRef.current = true;
+          resumeTimeoutRef.current = null;
+        }, 2500);
+      }
+    };
+    renderer.domElement.addEventListener('pointerdown', onPointerDown as any);
+    window.addEventListener('pointermove', onPointerMove as any);
+    window.addEventListener('pointerup', onPointerUp);
+    (window as any).addEventListener('pointerleave', onPointerUp);
 
     const onResize = () => {
       if (!mountEl || !cameraRef.current || !rendererRef.current) return;
@@ -213,8 +266,23 @@ function Globe({ chunks, nPerFace, onClose }: { chunks: Chunk[]; nPerFace: numbe
 
     function loop() {
       animRef.current = requestAnimationFrame(loop);
-      if (groupRef.current && autoRot && !drag) {
-        groupRef.current.rotation.y += 0.0015;
+      if (groupRef.current && !isDraggingRef.current && autoFollowRef.current) {
+        if (targetRotRef.current) {
+          const cur = groupRef.current.rotation;
+          const tgt = targetRotRef.current;
+          let dyRaw = tgt.y - cur.y;
+          dyRaw = Math.atan2(Math.sin(dyRaw), Math.cos(dyRaw));
+          const dy = Math.abs(dyRaw);
+          const lerp = dy > 0.8 ? 0.018 : dy > 0.3 ? 0.028 : 0.045;
+          cur.y += dyRaw * lerp;
+          cur.x += (tgt.x - cur.x) * lerp;
+          if (Math.abs(tgt.y - cur.y) < 0.001 && Math.abs(tgt.x - cur.x) < 0.001) {
+            cur.y = tgt.y;
+            cur.x = tgt.x;
+          }
+        } else {
+          groupRef.current.rotation.y += 0.0015;
+        }
       }
       // pulsate generating chunks
       if (geoRef.current && chunksRef.current.length) {
@@ -242,6 +310,11 @@ function Globe({ chunks, nPerFace, onClose }: { chunks: Chunk[]; nPerFace: numbe
     return () => {
       cancelAnimationFrame(animRef.current);
       ro.disconnect();
+      renderer.domElement.removeEventListener('pointerdown', onPointerDown as any);
+      window.removeEventListener('pointermove', onPointerMove as any);
+      window.removeEventListener('pointerup', onPointerUp);
+      (window as any).removeEventListener('pointerleave', onPointerUp);
+      if (resumeTimeoutRef.current) window.clearTimeout(resumeTimeoutRef.current);
       renderer.dispose();
       geo.dispose();
       mat.dispose();
@@ -399,9 +472,25 @@ function Globe({ chunks, nPerFace, onClose }: { chunks: Chunk[]; nPerFace: numbe
         <button onClick={onClose}><X /></button>
       </div>
       <div ref={mount} className="globeCanvas" />
+      {total > 0 && (
+        <div className="globeProgress">
+          <div className="globeProgressTop">
+            <span>{generatingChunk ? `GENERATING ${generatingChunk.id}` : done === total && total > 0 ? 'COMPLETE' : 'IDLE'} · {done} / {total} CHUNKS</span>
+            <b>{pct}%</b>
+          </div>
+          <div className="bar"><i style={{ width: `${pct}%` }} /></div>
+          <div className="globeProgressMeta">
+            {generatingChunk ? (
+              <>Chunk {generatingChunk.id} — {Math.round(generatingChunk.progress * 100)}% · Tile {generatingChunk.x + 1},{generatingChunk.y + 1} Face {faces[generatingChunk.face]} · {formatBytes(totalBytes)} total</>
+            ) : (
+              <>{formatBytes(totalBytes)} generated · {errors > 0 ? `${errors} error${errors === 1 ? '' : 's'}` : 'no errors'} · {pct === 100 && total > 0 ? 'All chunks complete' : 'Waiting for next chunk'}</>
+            )}
+          </div>
+        </div>
+      )}
       <div className="globeLegend">
         <span style={{ display: 'inline-flex', gap: 14, alignItems: 'center', flexWrap: 'wrap' }}>
-          <b>{complete}</b> / {chunks.length} sectors generated
+          <b>{complete}</b> / {chunks.length} chunks generated
           {generating > 0 && <span style={{ color: '#ffcf7a' }}>● {generating} generating</span>}
           {errors > 0 && <span style={{ color: '#ff6b6b' }}>● {errors} error</span>}
           <span style={{ opacity: 0.7 }}>Drag to explore • points = chunk centers • glow = completed terrain</span>
@@ -426,7 +515,7 @@ function App() {
   const [chunks, setChunks] = useState<Chunk[]>(() => []);
 
   // Current chunk list, kept in sync by updateChunks so the worker message
-  // handlers and the generation pump always see up-to-date sector states
+  // handlers and the generation pump always see up-to-date chunk states
   // without re-rendering.
   const chunksRef = useRef<Chunk[]>(chunks);
   const updateChunks = useCallback((fn: (cs: Chunk[]) => Chunk[]) => {
@@ -450,7 +539,7 @@ function App() {
     [regionEnabled, regionLat, regionLon, regionRadius, cfg.nPerFace],
   );
   const runnable = cfg.practical
-    || (regionPlan !== null && regionPlan.sectorCount > 0 && regionPlan.sectorCount <= PRACTICAL_CHUNK_LIMIT);
+    || (regionPlan !== null && regionPlan.chunkCount > 0 && regionPlan.chunkCount <= PRACTICAL_CHUNK_LIMIT);
 
   // Identity of the current queue definition. The effect below is the only
   // queue builder and reads the current preset/region values from this render,
@@ -590,7 +679,7 @@ function App() {
     if (ready.length === 0) return;
     packingRef.current = true;
     try {
-      setPack({ status: 'packing', message: `Packaging ${fmt(ready.length)} sectors…` });
+      setPack({ status: 'packing', message: `Packaging ${fmt(ready.length)} chunks…` });
       await new Promise(r => setTimeout(r, 0));
       const entries: ZipEntry[] = [];
       for (const c of ready) {
@@ -611,8 +700,8 @@ function App() {
       setPack({
         status: 'done',
         message: built.length > 1
-          ? `Packaged ${fmt(entries.length)} sectors into ${built.length} parts (${formatBytes(totalBytes)}) · ${built.map(b => b.name).join(' · ')} · downloading…`
-          : `Packaged ${fmt(entries.length)} sectors (${formatBytes(totalBytes)}) · downloading ${built[0].name}…`,
+          ? `Packaged ${fmt(entries.length)} chunks into ${built.length} parts (${formatBytes(totalBytes)}) · ${built.map(b => b.name).join(' · ')} · downloading…`
+          : `Packaged ${fmt(entries.length)} chunks (${formatBytes(totalBytes)}) · downloading ${built[0].name}…`,
       });
       for (const b of built) {
         triggerDownload(b.blob, b.name);
@@ -620,13 +709,13 @@ function App() {
       }
     } catch (err) {
       console.error('zip export failed', err);
-      setPack({ status: 'done', message: 'Packaging failed — see console. Completed sectors can still be downloaded individually.' });
+      setPack({ status: 'done', message: 'Packaging failed — see console. Completed chunks can still be downloaded individually.' });
     } finally {
       packingRef.current = false;
     }
   }, []);
 
-  // Generation pump: picks the next sector and hands it to the worker. Called
+  // Generation pump: picks the next chunk and hands it to the worker. Called
   // from the worker's done handler and from the [running, paused] effect below
   // (start/pause transitions only) — never chained through chunk state, so it
   // cannot nest updates.
@@ -663,7 +752,7 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [running, paused]);
 
-  // Actively generating sectors first in the Queue view so they stay visible
+  // Actively generating chunks first in the Queue view so they stay visible
   // under the render cap below.
   const visible = tab === 'pending'
     ? [...chunks.filter(c => c.status === 'generating'), ...chunks.filter(c => c.status === 'pending')]
@@ -683,8 +772,8 @@ function App() {
           </div>
         </div>
         <div className="headActions">
-          <button className="folder" onClick={() => demInput.current?.click()} title="Load MOLA GeoTIFF">
-            <FileImage /><span>{dem ? 'MOLA DEM loaded' : 'Load MOLA DEM'}</span>
+          <button className="folder" onClick={() => demInput.current?.click()} title="Load MOLA" disabled={!!dem}>
+            <FileImage /><span>{dem ? 'MOLA loaded' : 'Load MOLA'}</span>
           </button>
           <button className="folder" onClick={() => setConfigOpen(o => !o)} title="Generation settings">
             <Settings2 /><span>Settings</span>
@@ -714,17 +803,19 @@ function App() {
             {PRESETS.map(p => {
               const c = deriveConfig(p);
               const active = p.id === presetId;
+              const QualityIcon = p.quality === 'Low' ? SignalLow : p.quality === 'Standard' ? SignalMedium : SignalHigh;
               return (
                 <button
                   key={p.id}
                   className={`preset ${active ? 'active' : ''} ${c.practical ? '' : 'theoretical'}`}
                   onClick={() => { setPresetId(p.id); reset(); }}
                 >
+                  <div className="presetQuality"><QualityIcon /><span>{p.quality}</span></div>
                   <h3>{p.label}</h3>
                   <small>{c.practical ? '' : (regionEnabled ? 'REGION ONLY' : 'THEORETICAL')}</small>
                   <p>{p.description}</p>
                   <dl>
-                    <div><dt>Total sectors</dt><dd>{fmt(c.totalChunks)}</dd></div>
+                    <div><dt>Total chunks</dt><dd>{fmt(c.totalChunks)}</dd></div>
                     <div><dt>Vertex spacing</dt><dd>{formatMeters(c.sourceSpacingM)}</dd></div>
                     <div><dt>Est. output</dt><dd>{formatBytes(c.estimatedTotalBytes)}</dd></div>
                   </dl>
@@ -774,11 +865,11 @@ function App() {
             </div>
             {regionEnabled && regionPlan && (
               <div className="regionInfo">
-                Center sector <b>F{regionPlan.center.face}-{regionPlan.center.x}-{regionPlan.center.y}</b>
-                {' · '}<b>{fmt(regionPlan.sectorCount)}</b> sectors kept, {fmt(Math.max(0, cfg.totalChunks - regionPlan.sectorCount))} discarded
-                {' · '}≈ <b>{formatBytes(regionPlan.sectorCount * cfg.bytesPerChunk)}</b> total output
+                Center chunk <b>F{regionPlan.center.face}-{regionPlan.center.x}-{regionPlan.center.y}</b>
+                {' · '}<b>{fmt(regionPlan.chunkCount)}</b> chunks kept, {fmt(Math.max(0, cfg.totalChunks - regionPlan.chunkCount))} discarded
+                {' · '}≈ <b>{formatBytes(regionPlan.chunkCount * cfg.bytesPerChunk)}</b> total output
                 {' · '}radius ≈ <b>{formatMeters(regionPlan.radiusKm * 1000)}</b>
-                {' · '}nearest sectors generate first
+                {' · '}nearest chunks generate first
               </div>
             )}
           </div>
@@ -794,7 +885,7 @@ function App() {
         <div className="orbit">
           <Globe2 />
           <span>{fmt(cfg.totalChunks)}</span>
-          <small>SECTORS</small>
+          <small>CHUNKS</small>
         </div>
       </section>
 
@@ -826,7 +917,7 @@ function App() {
           <button
             onClick={() => void exportZip()}
             disabled={done === 0 || pack.status === 'packing'}
-            title={done === 0 ? 'Generate sectors first' : 'Package completed sectors into zip file(s) and download them'}
+            title={done === 0 ? 'Generate chunks first' : 'Package completed chunks into zip file(s) and download them'}
           >
             <Download /> {pack.status === 'packing' ? 'Packaging…' : 'Download ZIP'}
           </button>
@@ -859,11 +950,11 @@ function App() {
           {!runnable ? (
             <div className="empty">
               <AlertOctagon style={{ width: 32, height: 32, color: '#c95c4b', marginBottom: 12 }} />
-              <p>This preset ({cfg.preset.label}) is too large to manage in a browser tab — {fmt(cfg.totalChunks)} sectors would require {formatBytes(cfg.estimatedTotalBytes)} of output.</p>
+              <p>This preset ({cfg.preset.label}) is too large to manage in a browser tab — {fmt(cfg.totalChunks)} chunks would require {formatBytes(cfg.estimatedTotalBytes)} of output.</p>
               <p>Enable region export in Settings to generate just the chunks around a starting position, or select a smaller preset.</p>
             </div>
           ) : visible.length === 0 ? (
-            <div className="empty">No sectors in this view.</div>
+            <div className="empty">No chunks in this view.</div>
           ) : (
             <>
               {visible.slice(0, QUEUE_RENDER_LIMIT).map(c => (
@@ -874,7 +965,7 @@ function App() {
                   <span>{String(c.face + 1).padStart(2, '0')}</span>}
               </div>
               <div className="chunkInfo">
-                <h3>Sector {c.id}</h3>
+                <h3>Chunk {c.id}</h3>
                 <p>Cube face {faces[c.face]} · Tile {c.x + 1},{c.y + 1} · {fmt(cfg.verticesPerChunk)} vertices</p>
                 {c.status === 'generating' && <div className="mini"><i style={{ width: `${c.progress * 100}%` }} /></div>}
                 {c.error && <small>{c.error}</small>}
@@ -893,7 +984,7 @@ function App() {
               ))}
               {visible.length > QUEUE_RENDER_LIMIT && (
                 <div className="listMore">
-                  Showing {fmt(QUEUE_RENDER_LIMIT)} of {fmt(visible.length)} sectors in this view · all of them are packaged by Download ZIP
+                  Showing {fmt(QUEUE_RENDER_LIMIT)} of {fmt(visible.length)} chunks in this view · all of them are packaged by Download ZIP
                 </div>
               )}
             </>
