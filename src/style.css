@@ -20,4 +20,7 @@
 .preset dl dd{margin:0;color:#d7c9bf}
 .controls b{color:#d76b50;font-weight:500}
 .controls button:disabled[title]{cursor:not-allowed}
-@media(max-width:800px){main{padding:0 16px}.folder span{display:none}.hero{min-height:360px;padding:38px 2%}.hero h2{font-size:36px}.orbit{display:none}.status{grid-template-columns:1fr 1fr}.metric{border:0}.progress{grid-column:1/-1;padding:15px 0 0}.controls{align-items:flex-end}.controls>span{display:none}.queue article{padding:13px 12px}.chunkInfo p{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:45vw}.status .metric:nth-child(3){display:none}}
+@media(max-width:800px){main{padding:0 16px}.folder span{display:none}.hero{min-height:360px;padding:38px 2%}.hero h2{font-size:36px}.orbit{display:none}.status{grid-template-columns:1fr 1fr}.metric{border:0}.progress{grid-column:1/-1;padding:15px 0 0}.controls{align-items:flex-end}.controls>span{display:none}.queue article{padding:13px 12px}.chunkInfo p{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:45vw}.status .metric:nth-child(3){display:none}}.packBar{display:flex;align-items:center;gap:11px;border:1px solid #ffffff12;background:#171516;padding:13px 18px;margin:0 0 18px;font-family:'DM Mono';font-size:10px;letter-spacing:1.1px;color:#c8b8ad;line-height:1.7}
+.packBar svg{width:15px;height:15px;flex-shrink:0;color:#d76b50}
+.packBar .spin{animation:packSpin 1s linear infinite}
+@keyframes packSpin{to{transform:rotate(360deg)}}

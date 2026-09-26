@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState, useCallback } from 'react'
 import { createRoot } from 'react-dom/client';
 import { fromArrayBuffer } from 'geotiff';
 import {
-  FileImage, Globe2, Pause, Play, Square, RefreshCw, FolderOpen, Download,
+  FileImage, Globe2, Pause, Play, Square, RefreshCw, Download,
   CheckCircle2, Clock3, AlertTriangle, X, Database, HardDrive, Layers3, Settings2, AlertOctagon,
 } from 'lucide-react';
 import * as THREE from 'three';
@@ -10,6 +10,10 @@ import { Chunk } from './types';
 import {
   PRESETS, deriveConfig, formatBytes, formatMeters, fmt, Config, PRACTICAL_CHUNK_LIMIT,
 } from './config';
+import {
+  ZipEntry, buildZipBlob, planZipParts, zipPartName, crc32OfBlob,
+  ZIP_PART_MAX_FILES, ZIP_PART_MAX_BYTES,
+} from './zip';
 import './style.css';
 
 const faces = ['+X', '−X', '+Y', '−Y', '+Z', '−Z'];
@@ -388,27 +392,44 @@ function App() {
   // would hang the browser; we still expose their derived numbers.
   const [chunks, setChunks] = useState<Chunk[]>(() => makeInitialChunks(32));
   const prevNRef = useRef(32);
+
+  // Current chunk list, kept in sync by updateChunks so the worker message
+  // handlers and the generation pump always see up-to-date sector states
+  // without re-rendering.
+  const chunksRef = useRef<Chunk[]>(chunks);
+  const updateChunks = useCallback((fn: (cs: Chunk[]) => Chunk[]) => {
+    const next = fn(chunksRef.current);
+    chunksRef.current = next;
+    setChunks(next);
+  }, []);
+
   useEffect(() => {
     if (cfg.practical) {
-      setChunks(makeInitialChunks(N));
+      sessionRef.current = false;
+      setPack({ status: 'idle', message: '' });
+      updateChunks(() => makeInitialChunks(N));
       prevNRef.current = N;
     }
-  }, [N, cfg.practical]);
+  }, [N, cfg.practical, updateChunks]);
 
   const [tab, setTab] = useState<'pending' | 'complete' | 'error'>('pending');
   const [running, setRunning] = useState(false);
   const [paused, setPaused] = useState(false);
   const [globe, setGlobe] = useState(false);
   const [configOpen, setConfigOpen] = useState(false);
-  const [dir, setDir] = useState<FileSystemDirectoryHandle | null>(null);
-  const [dirName, setDirName] = useState<string>('');
   const [dem, setDem] = useState<string>('');
+  const [pack, setPack] = useState<{ status: 'idle' | 'packing' | 'done'; message: string }>({ status: 'idle', message: '' });
   const demInput = useRef<HTMLInputElement>(null);
-  const outputInput = useRef<HTMLInputElement>(null);
   const worker = useRef<Worker | null>(null);
   const busy = useRef(false);
+  const packingRef = useRef(false);
+  const sessionRef = useRef(false); // true while a generation run should auto-package on finish
   const cfgRef = useRef(cfg);
   cfgRef.current = cfg;
+  const runningRef = useRef(running);
+  runningRef.current = running;
+  const pausedRef = useRef(paused);
+  pausedRef.current = paused;
 
   const done = chunks.filter(c => c.status === 'complete').length;
   const total = chunks.reduce((a, c) => a + c.size, 0);
@@ -417,25 +438,10 @@ function App() {
   const reset = useCallback(() => {
     setRunning(false);
     setPaused(false);
-    setChunks(makeInitialChunks(cfgRef.current.nPerFace));
-  }, []);
-
-  async function chooseDir() {
-    if (!('showDirectoryPicker' in window)) { outputInput.current?.click(); return; }
-    try {
-      const d = await (window as any).showDirectoryPicker({ mode: 'readwrite' });
-      setDir(d);
-      setDirName(d.name || 'Directory linked');
-      const names = new Set<string>();
-      for await (const [name] of (d as any).entries()) names.add(name);
-      setChunks(cs => cs.map(c => names.has(`${c.id}.mars`) ? { ...c, status: 'complete', size: 0, progress: 1 } : c));
-    } catch (err: any) {
-      // AbortError = user cancelled - ignore. Otherwise fallback to legacy picker.
-      if (err?.name === 'AbortError') return;
-      console.warn('showDirectoryPicker failed, falling back to legacy picker', err);
-      outputInput.current?.click();
-    }
-  }
+    sessionRef.current = false;
+    setPack({ status: 'idle', message: '' });
+    updateChunks(() => makeInitialChunks(cfgRef.current.nPerFace));
+  }, [updateChunks]);
 
   async function chooseDem(file: File) {
     try {
@@ -447,22 +453,6 @@ function App() {
     }
   }
 
-  function chooseOutputFiles(files: FileList | null) {
-    if (!files || files.length === 0) return;
-    const fileArr = Array.from(files);
-    const names = new Set(fileArr.map(f => f.name));
-    // Try to infer folder name from webkitRelativePath (e.g. "myFolder/F0-0-0.mars" -> "myFolder")
-    const firstPath = (fileArr[0] as any).webkitRelativePath as string | undefined;
-    if (firstPath && firstPath.includes('/')) {
-      setDirName(firstPath.split('/')[0]);
-    } else {
-      setDirName(`${fileArr.length} files selected`);
-    }
-    const mola = fileArr.find(f => f.name === 'Mars_MGS_MOLA_DEM_mosaic_global_463m.tif')?.name;
-    if (mola) setDem(mola);
-    setChunks(cs => cs.map(c => names.has(`${c.id}.mars`) ? { ...c, status: 'complete', size: 0, progress: 1 } : c));
-  }
-
   useEffect(() => {
     fetch('./Mars_MGS_MOLA_DEM_mosaic_global_463m.tif')
       .then(r => r.ok ? r.blob() : Promise.reject())
@@ -470,61 +460,40 @@ function App() {
       .catch(() => {});
   }, []);
 
+  const pumpRef = useRef<() => void>(() => {});
+
   useEffect(() => {
     worker.current = new Worker(new URL('./terrain.worker.ts', import.meta.url), { type: 'module' });
-    worker.current.onmessage = async e => {
+    worker.current.onmessage = e => {
       const d = e.data;
       if (d.type === 'progress') {
-        setChunks(cs => cs.map(c => c.id === d.id ? { ...c, progress: d.progress } : c));
+        updateChunks(cs => cs.map(c => c.id === d.id ? { ...c, progress: d.progress } : c));
       }
       if (d.type === 'done') {
         const blob: Blob = d.blob;
-        if (dir) {
-          try {
-            const f = await dir.getFileHandle(`${d.id}.mars`, { create: true });
-            const w = await f.createWritable();
-            await w.write(blob);
-            await w.close();
-          } catch {}
-        }
-        setChunks(cs => cs.map(c => c.id === d.id
-          ? { ...c, status: 'complete', progress: 1, size: blob.size, blob, heights: d.heights }
+        updateChunks(cs => cs.map(c => c.id === d.id
+          ? { ...c, status: 'complete', progress: 1, size: blob.size, blob, crc: d.crc, heights: d.heights }
           : c));
         busy.current = false;
+        pumpRef.current(); // continue the queue from the message handler, not an effect
       }
     };
     return () => worker.current?.terminate();
-  }, [dir]);
-
-  useEffect(() => {
-    if (!running || paused || busy.current) return;
-    const next = chunks.find(c => c.status === 'pending' || c.status === 'error');
-    if (!next) { setRunning(false); return; }
-    busy.current = true;
-    setChunks(cs => cs.map(c => c.id === next.id ? { ...c, status: 'generating', error: undefined } : c));
-    worker.current?.postMessage({
-      type: 'generate',
-      id: next.id,
-      face: next.face,
-      cx: next.x,
-      cy: next.y,
-      res: cfg.resolution,
-      chunks: N,
-    });
-  }, [running, paused, chunks, cfg.resolution, N]);
+  }, [updateChunks]);
 
   function stop() {
     setRunning(false);
     setPaused(false);
     worker.current?.postMessage({ type: 'stop' });
     busy.current = false;
-    setChunks(cs => cs.map(c => c.status === 'generating'
+    updateChunks(cs => cs.map(c => c.status === 'generating'
       ? { ...c, status: 'error', progress: 0, error: 'Generation interrupted — no partial file saved' }
       : c));
   }
 
   function retry(id: string) {
-    setChunks(cs => cs.map(c => c.id === id ? { ...c, status: 'pending', progress: 0, error: undefined } : c));
+    sessionRef.current = true;
+    updateChunks(cs => cs.map(c => c.id === id ? { ...c, status: 'pending', progress: 0, error: undefined } : c));
     setRunning(true);
   }
 
@@ -537,14 +506,102 @@ function App() {
     URL.revokeObjectURL(a.href);
   }
 
+  function triggerDownload(blob: Blob, name: string) {
+    const a = document.createElement('a');
+    const url = URL.createObjectURL(blob);
+    a.href = url;
+    a.download = name;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  }
+
+  // Package every completed tile into one or more zip archives and hand them
+  // to the browser as downloads. Splits when the file count or overall size
+  // exceeds the per-archive caps (see zip.ts); split parts are named
+  // `<base>_PART-#.zip`. Large archives are composed from the existing tile
+  // blobs without copying their payloads.
+  const exportZip = useCallback(async () => {
+    if (packingRef.current) return;
+    const ready = chunksRef.current.filter(c => c.status === 'complete' && c.blob);
+    if (ready.length === 0) return;
+    packingRef.current = true;
+    try {
+      setPack({ status: 'packing', message: `Packaging ${fmt(ready.length)} sectors…` });
+      await new Promise(r => setTimeout(r, 0));
+      const entries: ZipEntry[] = [];
+      for (const c of ready) {
+        const blob = c.blob!;
+        entries.push({ name: `${c.id}.mars`, blob, crc32: typeof c.crc === 'number' ? c.crc : await crc32OfBlob(blob) });
+      }
+      const parts = planZipParts(entries);
+      const base = `mars-terrain-${cfgRef.current.nPerFace}x${cfgRef.current.nPerFace}`;
+      const built: { blob: Blob; name: string }[] = [];
+      for (let i = 0; i < parts.length; i++) {
+        setPack({ status: 'packing', message: `Building ${parts.length > 1 ? `part ${i + 1} of ${parts.length}` : 'archive'}…` });
+        await new Promise(r => setTimeout(r, 0));
+        built.push({ blob: buildZipBlob(parts[i]), name: zipPartName(base, i + 1, parts.length) });
+      }
+      const totalBytes = built.reduce((a, b) => a + b.blob.size, 0);
+      setPack({
+        status: 'done',
+        message: built.length > 1
+          ? `Packaged ${fmt(entries.length)} sectors into ${built.length} parts (${formatBytes(totalBytes)}) · ${built.map(b => b.name).join(' · ')} · downloading…`
+          : `Packaged ${fmt(entries.length)} sectors (${formatBytes(totalBytes)}) · downloading ${built[0].name}…`,
+      });
+      for (const b of built) {
+        triggerDownload(b.blob, b.name);
+        await new Promise(r => setTimeout(r, 750));
+      }
+    } catch (err) {
+      console.error('zip export failed', err);
+      setPack({ status: 'done', message: 'Packaging failed — see console. Completed sectors can still be downloaded individually.' });
+    } finally {
+      packingRef.current = false;
+    }
+  }, []);
+
+  // Generation pump: picks the next sector and hands it to the worker. Called
+  // from the worker's done handler and from the [running, paused] effect below
+  // (start/pause transitions only) — never chained through chunk state, so it
+  // cannot nest updates.
+  const pump = useCallback(() => {
+    const cs = chunksRef.current;
+    if (!runningRef.current || pausedRef.current || busy.current) return;
+    const next = cs.find(c => c.status === 'pending' || c.status === 'error');
+    if (!next) {
+      if (runningRef.current) setRunning(false);
+      // A generation run finished cleanly — package and download automatically.
+      if (sessionRef.current && cs.length > 0 && cs.every(c => c.status === 'complete')) {
+        sessionRef.current = false;
+        void exportZip();
+      }
+      return;
+    }
+    busy.current = true;
+    updateChunks(list => list.map(c => c.id === next.id ? { ...c, status: 'generating', error: undefined } : c));
+    worker.current?.postMessage({
+      type: 'generate',
+      id: next.id,
+      face: next.face,
+      cx: next.x,
+      cy: next.y,
+      res: cfgRef.current.resolution,
+      chunks: cfgRef.current.nPerFace,
+    });
+  }, [updateChunks, exportZip]);
+  pumpRef.current = pump;
+
+  // Wake the pump on start/pause/stop/resume transitions only.
+  useEffect(() => {
+    pumpRef.current();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [running, paused]);
+
   const visible = chunks.filter(c =>
     tab === 'pending' ? ['pending', 'generating'].includes(c.status) : c.status === tab);
 
   return (
     <main>
-      <input ref={outputInput} type="file" style={{ display: 'none' }} multiple
-        {...({ webkitdirectory: '', directory: '' } as any)}
-        onChange={e => { chooseOutputFiles(e.target.files); if (e.target) e.target.value = ''; }} />
       <input ref={demInput} type="file" hidden accept=".tif,.tiff,image/tiff"
         onChange={e => e.target.files?.[0] && chooseDem(e.target.files[0])} />
 
@@ -557,9 +614,6 @@ function App() {
           </div>
         </div>
         <div className="headActions">
-          <button className="folder" onClick={chooseDir} title={dirName || 'Select output folder'}>
-            <FolderOpen /><span>{dirName || (dir ? 'Directory linked' : 'Select output')}</span>
-          </button>
           <button className="folder" onClick={() => demInput.current?.click()} title="Load MOLA GeoTIFF">
             <FileImage /><span>{dem ? 'MOLA DEM loaded' : 'Load MOLA DEM'}</span>
           </button>
@@ -637,7 +691,7 @@ function App() {
         <div>
           <button
             className="primary"
-            onClick={() => { setRunning(true); setPaused(false); }}
+            onClick={() => { sessionRef.current = true; setRunning(true); setPaused(false); }}
             disabled={(running && !paused) || !cfg.practical}
             title={!cfg.practical ? 'This preset is too large to run in-browser' : ''}
           >
@@ -648,6 +702,13 @@ function App() {
           {cfg.practical && (
             <button onClick={reset} title="Reset queue"><RefreshCw /> Reset</button>
           )}
+          <button
+            onClick={() => void exportZip()}
+            disabled={done === 0 || pack.status === 'packing'}
+            title={done === 0 ? 'Generate sectors first' : 'Package completed sectors into zip file(s) and download them'}
+          >
+            <Download /> {pack.status === 'packing' ? 'Packaging…' : 'Download ZIP'}
+          </button>
         </div>
         <span>
           {cfg.resolution} × {cfg.resolution} vertices per chunk ·
@@ -656,6 +717,13 @@ function App() {
           {' '}MARS binary · preset <b>{cfg.preset.label}</b>
         </span>
       </section>
+
+      {pack.status !== 'idle' && (
+        <div className="packBar">
+          {pack.status === 'packing' ? <RefreshCw className="spin" /> : <CheckCircle2 />}
+          <span>{pack.message}</span>
+        </div>
+      )}
 
       <section className="queue">
         <div className="tabs">
