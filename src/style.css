@@ -14,6 +14,11 @@
 .preset h3{margin:0;font-size:17px;font-weight:600;letter-spacing:-0.5px}
 .preset small{position:absolute;top:14px;right:14px;font-family:'DM Mono';font-size:8px;letter-spacing:1.5px;color:#c95c4b}
 .preset p{color:#8f8984;font-size:10.5px;line-height:1.5;margin:8px 0 14px;min-height:32px}
+.presetQuality{display:inline-flex;align-items:center;gap:6px;font-family:'DM Mono';font-size:9px;letter-spacing:1.4px;color:#9a8e85;background:#ffffff08;border:1px solid #ffffff12;padding:4px 8px;border-radius:3px;margin-bottom:10px}
+.presetQuality svg{width:14px;height:14px;color:#d76b50}
+.preset.active .presetQuality{border-color:#cf5b4344;color:#e0805f;background:#2b171455}
+.presetQuality span{font-weight:500;text-transform:uppercase}
+.headActions button:disabled{opacity:.35;cursor:not-allowed}
 .preset dl{margin:0;display:grid;gap:4px}
 .preset dl div{display:flex;justify-content:space-between;font-family:'DM Mono';font-size:9.5px}
 .preset dl dt{color:#817a75;letter-spacing:1px}

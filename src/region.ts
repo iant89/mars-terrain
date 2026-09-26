@@ -9,7 +9,7 @@
 // from the exact inverse cube-sphere projection of the start position onto
 // each face, and every candidate is verified by angular distance — the cost
 // scales with the region, not the planet. This is what lets region mode run
-// even ultra-high-density presets (4096×4096 and up) for a small play area.
+// even the highest-density presets for a small play area.
 
 import { MARS_RADIUS_M } from './config';
 
@@ -28,7 +28,7 @@ export type RegionPlan = {
   center: RegionTile;       // the tile containing the starting position
   tileAngleRad: number;     // angular width of one tile at the center
   radiusKm: number;         // approximate physical radius of the region
-  sectorCount: number;
+  chunkCount: number;
 };
 
 // --- vector / cube-sphere math (same model as the terrain worker) -----------
@@ -197,6 +197,6 @@ export function planRegion(nPerFace: number, spec: RegionSpec): RegionPlan {
     center,
     tileAngleRad,
     radiusKm,
-    sectorCount: tiles.length,
+    chunkCount: tiles.length,
   };
 }

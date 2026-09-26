@@ -12,16 +12,13 @@ export type ChunkPreset = {
   label: string;           // e.g. "16 × 16"
   description: string;     // short human-readable description
   nPerFace: number;        // chunks per face edge
+  quality: 'Low' | 'Standard' | 'High';
 };
 
 export const PRESETS: ChunkPreset[] = [
-  { id: 'n16',    label: '16 × 16',     nPerFace: 16,     description: 'Coarse — 1,536 sectors, fast preview.' },
-  { id: 'n32',    label: '32 × 32',     nPerFace: 32,     description: 'Standard — 6,144 sectors, ~400 MB total output.' },
-  { id: 'n256',   label: '256 × 256',   nPerFace: 256,    description: 'Fine — 393,216 sectors, ~25 GB. Requires disk streaming.' },
-  { id: 'n4096',  label: '4096 × 4096', nPerFace: 4096,   description: 'Very high — ~100.6M sectors, ~6.4 TB. Theoretical only.' },
-  { id: 'n16384', label: '16384 × 16384', nPerFace: 16384, description: 'Ultra — ~1.6B sectors, ~102 TB. Theoretical only.' },
-  { id: 'n32768', label: '32768 × 32768', nPerFace: 32768, description: 'Extreme — ~6.4B sectors, ~410 TB. Theoretical only.' },
-  { id: 'n65536', label: '65536 × 65536', nPerFace: 65536, description: 'Maximum — ~25.7B sectors, ~1.6 PB. Theoretical only.' },
+  { id: 'n16',  label: '16 × 16',   nPerFace: 16,  quality: 'Low',      description: 'Low — 1,536 chunks, fast preview.' },
+  { id: 'n32',  label: '32 × 32',   nPerFace: 32,  quality: 'Standard', description: 'Standard — 6,144 chunks, ~400 MB total output.' },
+  { id: 'n256', label: '256 × 256', nPerFace: 256, quality: 'High',     description: 'High — 393,216 chunks, ~25 GB. Requires disk streaming.' },
 ];
 
 // Approximate threshold (number of chunks) beyond which in-browser generation
