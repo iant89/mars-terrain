@@ -127,6 +127,7 @@ function App() {
   const [globe, setGlobe] = useState(false);
   const [configOpen, setConfigOpen] = useState(false);
   const [dir, setDir] = useState<FileSystemDirectoryHandle | null>(null);
+  const [dirName, setDirName] = useState<string>('');
   const [dem, setDem] = useState<string>('');
   const demInput = useRef<HTMLInputElement>(null);
   const outputInput = useRef<HTMLInputElement>(null);
@@ -147,11 +148,19 @@ function App() {
 
   async function chooseDir() {
     if (!('showDirectoryPicker' in window)) { outputInput.current?.click(); return; }
-    const d = await (window as any).showDirectoryPicker({ mode: 'readwrite' });
-    setDir(d);
-    const names = new Set<string>();
-    for await (const [name] of (d as any).entries()) names.add(name);
-    setChunks(cs => cs.map(c => names.has(`${c.id}.mars`) ? { ...c, status: 'complete', size: 0, progress: 1 } : c));
+    try {
+      const d = await (window as any).showDirectoryPicker({ mode: 'readwrite' });
+      setDir(d);
+      setDirName(d.name || 'Directory linked');
+      const names = new Set<string>();
+      for await (const [name] of (d as any).entries()) names.add(name);
+      setChunks(cs => cs.map(c => names.has(`${c.id}.mars`) ? { ...c, status: 'complete', size: 0, progress: 1 } : c));
+    } catch (err: any) {
+      // AbortError = user cancelled - ignore. Otherwise fallback to legacy picker.
+      if (err?.name === 'AbortError') return;
+      console.warn('showDirectoryPicker failed, falling back to legacy picker', err);
+      outputInput.current?.click();
+    }
   }
 
   async function chooseDem(file: File) {
@@ -165,9 +174,17 @@ function App() {
   }
 
   function chooseOutputFiles(files: FileList | null) {
-    if (!files) return;
-    const names = new Set(Array.from(files).map(f => f.name));
-    const mola = Array.from(files).find(f => f.name === 'Mars_MGS_MOLA_DEM_mosaic_global_463m.tif')?.name;
+    if (!files || files.length === 0) return;
+    const fileArr = Array.from(files);
+    const names = new Set(fileArr.map(f => f.name));
+    // Try to infer folder name from webkitRelativePath (e.g. "myFolder/F0-0-0.mars" -> "myFolder")
+    const firstPath = (fileArr[0] as any).webkitRelativePath as string | undefined;
+    if (firstPath && firstPath.includes('/')) {
+      setDirName(firstPath.split('/')[0]);
+    } else {
+      setDirName(`${fileArr.length} files selected`);
+    }
+    const mola = fileArr.find(f => f.name === 'Mars_MGS_MOLA_DEM_mosaic_global_463m.tif')?.name;
     if (mola) setDem(mola);
     setChunks(cs => cs.map(c => names.has(`${c.id}.mars`) ? { ...c, status: 'complete', size: 0, progress: 1 } : c));
   }
@@ -251,9 +268,9 @@ function App() {
 
   return (
     <main>
-      <input ref={outputInput} type="file" hidden multiple
-        {...({ webkitdirectory: true } as any)}
-        onChange={e => chooseOutputFiles(e.target.files)} />
+      <input ref={outputInput} type="file" style={{ display: 'none' }} multiple
+        {...({ webkitdirectory: '', directory: '' } as any)}
+        onChange={e => { chooseOutputFiles(e.target.files); if (e.target) e.target.value = ''; }} />
       <input ref={demInput} type="file" hidden accept=".tif,.tiff,image/tiff"
         onChange={e => e.target.files?.[0] && chooseDem(e.target.files[0])} />
 
@@ -266,8 +283,8 @@ function App() {
           </div>
         </div>
         <div className="headActions">
-          <button className="folder" onClick={chooseDir}>
-            <FolderOpen /><span>{dir ? 'Directory linked' : 'Select output'}</span>
+          <button className="folder" onClick={chooseDir} title={dirName || 'Select output folder'}>
+            <FolderOpen /><span>{dirName || (dir ? 'Directory linked' : 'Select output')}</span>
           </button>
           <button className="folder" onClick={() => demInput.current?.click()} title="Load MOLA GeoTIFF">
             <FileImage /><span>{dem ? 'MOLA DEM loaded' : 'Load MOLA DEM'}</span>
