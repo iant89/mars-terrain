@@ -788,7 +788,7 @@ function App() {
       <section className="hero">
         <div>
           <span className="eyebrow"><i /> LOCAL GENERATION PIPELINE</span>
-          <h2>Forge the red planet,<br /><em>one sector at a time.</em></h2>
+          <h2>Forge the red planet,<br /><em>one chunk at a time.</em></h2>
           <p>Deterministic cube-sphere terrain informed by NASA MOLA elevation characteristics. Generated entirely on your device.</p>
         </div>
         <div className="orbit">
