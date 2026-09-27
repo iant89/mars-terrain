@@ -130,6 +130,13 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
   const framedOnceRef = useRef(false);
   const framedNRef = useRef(0);
   const fpsRef = useRef(0);
+  // Live preview (opened without pinning a tile): keep up with the generation
+  // frontier automatically so completed chunks keep streaming into the scene
+  // instead of stopping once the window around the focus is full.
+  const autoFollowRef = useRef(focus == null);
+  // Cleared for good once the user drags, zooms or flies — until then the
+  // camera keeps fitting itself to the growing/sliding window.
+  const cameraTouchedRef = useRef(false);
 
   const orbitRef = useRef({ theta: 0.6, phi: 1.02, distance: 1000, target: new THREE.Vector3() });
   const flyRef = useRef({ pos: new THREE.Vector3(0, 5000, 2000), yaw: 0, pitch: -0.2 });
@@ -332,13 +339,17 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
     }
     if (sunRef.current) sunRef.current.position.setLength(Math.max(1e4, winSpan * 4));
 
-    // Camera framing: full framing on the first build, on Recenter and whenever
-    // the tile grid changes size; moving the focus (follow mode) only slides the
-    // orbit target so the user's zoom and angles survive.
+    // Camera framing: full framing on the first build, on Recenter, whenever
+    // the tile grid changes size, and continuously while the user hasn't taken
+    // manual control (the window grows and slides as chunks stream in, so an
+    // untouched camera keeps the whole window in frame). Once they drag, zoom
+    // or fly, moving the focus (follow mode) only slides the orbit target so
+    // the user's zoom and angles survive.
     const centerKey = `${N}|${center.face}-${center.x}-${center.y}`;
     const moved = framedKeyRef.current !== centerKey;
-    if (frameCamera || moved) {
-      const full = frameCamera || !framedOnceRef.current || framedNRef.current !== N;
+    const autoFit = !cameraTouchedRef.current;
+    if (frameCamera || moved || autoFit) {
+      const full = frameCamera || autoFit || !framedOnceRef.current || framedNRef.current !== N;
       framedKeyRef.current = centerKey;
       framedOnceRef.current = true;
       framedNRef.current = N;
@@ -380,6 +391,7 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
     let complete = 0;
     let idsMatch = true;
     let newest: TileRecord | null = null;
+    const newcomers: TileRecord[] = [];
 
     for (const c of chunks) {
       if (c.status !== 'complete' || !c.heights) continue;
@@ -401,6 +413,7 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
       index.set(tileKey(c.face, c.x, c.y), rec);
       added = true;
       newest = rec;
+      newcomers.push(rec);
     }
 
     // Removals (reset, re-generate) show up as a count mismatch.
@@ -421,6 +434,24 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
 
     if (newest && paramsRef.current.follow) {
       setFocusTile({ face: newest.face, x: newest.x, y: newest.y });
+    } else if (newcomers.length > 0 && autoFollowRef.current) {
+      // Live preview: when the generation frontier leaves the visible window,
+      // slide to the nearest new tile outside it so completed chunks keep
+      // streaming into the scene instead of stopping at the window edge.
+      // Nearest-outside (not newest) keeps the slide gentle when a batch of
+      // completions lands at once.
+      const win = windowRef.current;
+      if (win) {
+        const p = paramsRef.current;
+        const centerDir = tileCenterDir(win.center.face, win.center.x, win.center.y, p.nPerFace);
+        let best: TileRecord | null = null;
+        let bestD = Infinity;
+        for (const rec of newcomers) {
+          const d = angleBetween(rec.dir, centerDir);
+          if (d > win.windowAngle && d < bestD) { bestD = d; best = rec; }
+        }
+        if (best) setFocusTile({ face: best.face, x: best.x, y: best.y });
+      }
     }
     return added;
   }, [getChunks, disposeMesh]);
@@ -484,6 +515,7 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
     // --- interaction ---------------------------------------------------------
     const el = renderer.domElement;
     const onPointerDown = (e: PointerEvent) => {
+      cameraTouchedRef.current = true;
       if (paramsRef.current.mode === 'fly') {
         if (!lockedRef.current) el.requestPointerLock?.();
         return;
@@ -522,6 +554,7 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
     };
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
+      cameraTouchedRef.current = true;
       const o = orbitRef.current;
       const max = Math.max(2e4, (windowRef.current?.span ?? 1e4) * 20);
       o.distance = Math.max(5, Math.min(max, o.distance * Math.exp(e.deltaY * 0.0012)));
@@ -530,7 +563,11 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
     const onKeyDown = (e: KeyboardEvent) => {
       const t = e.target as HTMLElement | null;
       if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
-      keysRef.current.add(e.key.toLowerCase());
+      const k = e.key.toLowerCase();
+      if (['w', 'a', 's', 'd', 'q', 'e', 'c', ' ', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(k)) {
+        cameraTouchedRef.current = true;
+      }
+      keysRef.current.add(k);
       if (e.key === 'Escape' && lockedRef.current) document.exitPointerLock?.();
     };
     const onKeyUp = (e: KeyboardEvent) => keysRef.current.delete(e.key.toLowerCase());
