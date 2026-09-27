@@ -112,6 +112,8 @@
 .viewerHud .hudRow span{color:#7c7570;letter-spacing:1.4px;font-size:8.5px}
 .viewerHud .hudRow b{color:#d7c9bf;font-weight:500;margin-right:6px}
 .viewerHud .hudRow.dim b{color:#9a8e85}
+.viewerVoid{position:absolute;top:16px;left:50%;transform:translateX(-50%);display:flex;align-items:center;gap:9px;background:#151314d9;border:1px solid #ffffff18;padding:9px 14px;font-family:'DM Mono';font-size:9.5px;letter-spacing:0.8px;color:#a39a94;z-index:3;pointer-events:none;max-width:72%}
+.viewerVoid svg{width:15px;height:15px;flex-shrink:0;color:#c95c4b}
 .viewerHint{position:absolute;bottom:16px;left:50%;transform:translateX(-50%);font-family:'DM Mono';font-size:9px;letter-spacing:1.2px;color:#8f8984;background:#151314cc;border:1px solid #ffffff14;padding:8px 15px;z-index:3;pointer-events:none;white-space:nowrap}
 .viewerHint b{color:#c8b8ad;font-weight:500}
 @media(max-width:900px){
