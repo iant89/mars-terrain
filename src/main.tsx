@@ -1,6 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { createRoot } from 'react-dom/client';
-import { fromArrayBuffer } from 'geotiff';
 import {
   FileImage, Globe2, Pause, Play, Square, RefreshCw, Download, Eye, Mountain,
   CheckCircle2, Clock3, AlertTriangle, X, Database, HardDrive, Layers3, Settings2, AlertOctagon,
@@ -21,6 +20,9 @@ import { planRegion, RegionSpec } from './region';
 import './style.css';
 
 const faces = ['+X', '−X', '+Y', '−Y', '+Z', '−Z'];
+const APP_VERSION = __APP_COMMIT__ === 'unknown' ? 'unknown' : __APP_COMMIT__.slice(0, 8);
+type VersionState = 'checking' | 'current' | 'outdated' | 'unknown';
+type MainUpdate = { mainSha: string; aheadBy: number };
 
 // The renderer is memoized: its props are stable, so the progress updates that
 // re-render App during a run never touch it (it polls the queue itself).
@@ -517,6 +519,62 @@ function Globe({ chunks, nPerFace, onClose }: { chunks: Chunk[]; nPerFace: numbe
 }
 
 function App() {
+  const [versionState, setVersionState] = useState<VersionState>('checking');
+  const [mainUpdate, setMainUpdate] = useState<MainUpdate | null>(null);
+  const dismissedMainRef = useRef('');
+
+  useEffect(() => {
+    if (!/^[a-f0-9]{7,40}$/i.test(__APP_COMMIT__)) {
+      setVersionState('unknown');
+      return;
+    }
+
+    let active = true;
+    const checkMainVersion = async () => {
+      try {
+        const response = await fetch(
+          `https://api.github.com/repos/iant89/mars-terrain/compare/${__APP_COMMIT__}...main`,
+          { headers: { Accept: 'application/vnd.github+json' }, cache: 'no-store' },
+        );
+        if (!response.ok) throw new Error(`GitHub version check returned ${response.status}`);
+
+        const comparison = await response.json() as {
+          status?: string;
+          ahead_by?: number;
+          commits?: Array<{ sha?: string }>;
+        };
+        if (!active) return;
+
+        const aheadBy = comparison.ahead_by ?? 0;
+        const mainIsNewer = (comparison.status === 'ahead' || comparison.status === 'diverged') && aheadBy > 0;
+        if (mainIsNewer) {
+          const mainSha = comparison.commits?.at(-1)?.sha || `${comparison.status}-${aheadBy}`;
+          setVersionState('outdated');
+          if (dismissedMainRef.current === mainSha) setMainUpdate(null);
+          else setMainUpdate({ mainSha, aheadBy });
+        } else if (comparison.status === 'identical' || comparison.status === 'behind') {
+          // "behind" means main is behind this build, so this build already includes main.
+          setVersionState('current');
+          setMainUpdate(null);
+        } else {
+          setVersionState('unknown');
+        }
+      } catch {
+        // A network/API failure should not falsely label a build as current or outdated.
+        if (active) setVersionState(current => current === 'checking' ? 'unknown' : current);
+      }
+    };
+
+    void checkMainVersion();
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') void checkMainVersion();
+    }, 10 * 60 * 1000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, []);
+
   const [presetId, setPresetId] = useState<string>('n32');
   const cfg: Config = useMemo(
     () => deriveConfig(PRESETS.find(p => p.id === presetId) ?? PRESETS[1]),
@@ -596,8 +654,14 @@ function App() {
   const closeViewer = useCallback(() => setViewer(null), []);
   const [configOpen, setConfigOpen] = useState(false);
   const [dem, setDem] = useState<string>('');
+  const [demReady, setDemReady] = useState(false);
+  const [demLoading, setDemLoading] = useState(false);
+  const [cacheWarning, setCacheWarning] = useState('');
   const [pack, setPack] = useState<{ status: 'idle' | 'packing' | 'done'; message: string }>({ status: 'idle', message: '' });
   const demInput = useRef<HTMLInputElement>(null);
+  const demSourceRef = useRef<{ sourceId: number; name: string; autoLoad: boolean } | null>(null);
+  const pendingDemMessageRef = useRef<any>(null);
+  const demSourceIdRef = useRef(0);
   const worker = useRef<Worker | null>(null);
   const busy = useRef(false);
   const packingRef = useRef(false);
@@ -623,22 +687,37 @@ function App() {
     setResetNonce(x => x + 1);
   }, []);
 
-  async function chooseDem(file: File) {
-    try {
-      const tiff = await fromArrayBuffer(await file.arrayBuffer());
-      const image = await tiff.getImage();
-      setDem(`${file.name} · ${image.getWidth()} × ${image.getHeight()}`);
-    } catch {
-      setDem(`${file.name} · unable to read GeoTIFF`);
+  function sendDemSource(message: any) {
+    const sourceId = ++demSourceIdRef.current;
+    const source = { sourceId, name: message.name, autoLoad: !!message.autoLoad };
+    demSourceRef.current = source;
+    message.sourceId = sourceId;
+    pendingDemMessageRef.current = message;
+    setRunning(false);
+    setPaused(false);
+    sessionRef.current = false;
+    busy.current = false;
+    setPack({ status: 'idle', message: '' });
+    setResetNonce(value => value + 1);
+    setCacheWarning('');
+    setDemReady(false);
+    setDemLoading(true);
+    setDemError('');
+    setDem(source.autoLoad ? 'Opening bundled MOLA by byte range…' : `Opening ${source.name} by byte range…`);
+    if (worker.current) {
+      worker.current.postMessage(message);
+      pendingDemMessageRef.current = null;
     }
   }
 
-  useEffect(() => {
-    fetch('./Mars_MGS_MOLA_DEM_mosaic_global_463m.tif')
-      .then(r => r.ok ? r.blob() : Promise.reject())
-      .then(b => chooseDem(new File([b], 'Mars_MGS_MOLA_DEM_mosaic_global_463m.tif')))
-      .catch(() => {});
-  }, []);
+  const [demError, setDemError] = useState('');
+
+  function chooseDem(file: File) {
+    sendDemSource({
+      type: 'set-dem-blob', kind: 'blob', blob: file,
+      name: file.name, size: file.size, modified: file.lastModified,
+    });
+  }
 
   const pumpRef = useRef<() => void>(() => {});
 
@@ -646,24 +725,59 @@ function App() {
     worker.current = new Worker(new URL('./terrain.worker.ts', import.meta.url), { type: 'module' });
     worker.current.onmessage = e => {
       const d = e.data;
+      if (d.type === 'dem-loading' && d.sourceId === demSourceRef.current?.sourceId) {
+        setDemLoading(true);
+      }
+      if (d.type === 'dem-ready' && d.sourceId === demSourceRef.current?.sourceId) {
+        setDemReady(true);
+        setDemLoading(false);
+        setDemError('');
+        setDem(`${d.name} · ${fmt(d.width)} × ${fmt(d.height)} · tiled reads`);
+      }
+      if (d.type === 'dem-error' && d.sourceId === demSourceRef.current?.sourceId) {
+        setDemReady(false);
+        setDemLoading(false);
+        const message = String(d.message ?? 'Unable to open the DEM.');
+        const source = demSourceRef.current;
+        setDemError(source?.autoLoad ? '' : message);
+        setDem(source?.autoLoad ? '' : `MOLA unavailable · ${message}`);
+      }
       if (d.type === 'progress') {
         updateChunks(cs => cs.map(c => c.id === d.id ? { ...c, progress: d.progress } : c));
       }
-      if (d.type === 'done') {
-        const blob: Blob = d.blob;
-        // heights/materials are transferred from the worker and kept for the
-        // 3D renderer; the blob holds its own copy for export.
-        const heights: Float32Array = d.heights;
-        const materials: Uint8Array | undefined = d.materials;
+      if (d.type === 'error') {
         updateChunks(cs => cs.map(c => c.id === d.id
-          ? { ...c, status: 'complete', progress: 1, size: blob.size, blob, crc: d.crc, heights, materials }
+          ? { ...c, status: 'error', progress: 0, error: d.message }
           : c));
         busy.current = false;
-        pumpRef.current(); // continue the queue from the message handler, not an effect
+        pumpRef.current();
+      }
+      if (d.type === 'done') {
+        const blob: Blob = d.blob;
+        const heights: Float32Array = d.heights;
+        const materials: Uint8Array | undefined = d.materials;
+        if (d.cacheError) setCacheWarning(`Generated terrain could not be saved to the browser cache: ${d.cacheError}`);
+        updateChunks(cs => cs.map(c => c.id === d.id
+          ? { ...c, status: 'complete', progress: 1, size: blob.size, blob, crc: d.crc, heights, materials, cached: !!d.cached }
+          : c));
+        busy.current = false;
+        pumpRef.current();
       }
     };
+    if (pendingDemMessageRef.current) {
+      worker.current.postMessage(pendingDemMessageRef.current);
+      pendingDemMessageRef.current = null;
+    }
     return () => worker.current?.terminate();
   }, [updateChunks]);
+
+  useEffect(() => {
+    // fromUrl + Range requests keeps the optional bundled 2 GB MOLA file as a
+    // byte-range source rather than fetching it into one giant browser Blob.
+    const url = new URL('./Mars_MGS_MOLA_DEM_mosaic_global_463m.tif', window.location.href).toString();
+    sendDemSource({ type: 'set-dem-url', kind: 'url', url, name: 'MOLA global 463 m', autoLoad: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   function stop() {
     setRunning(false);
@@ -676,6 +790,10 @@ function App() {
   }
 
   function retry(id: string) {
+    if (!demReady) {
+      setDemError('Load a global MOLA DEM before generating terrain.');
+      return;
+    }
     sessionRef.current = true;
     updateChunks(cs => cs.map(c => c.id === id ? { ...c, status: 'pending', progress: 0, error: undefined } : c));
     setRunning(true);
@@ -792,19 +910,37 @@ function App() {
   return (
     <main>
       <input ref={demInput} type="file" hidden accept=".tif,.tiff,image/tiff"
-        onChange={e => e.target.files?.[0] && chooseDem(e.target.files[0])} />
+        onChange={e => {
+          const file = e.target.files?.[0];
+          e.currentTarget.value = '';
+          if (file) chooseDem(file);
+        }} />
 
       <header>
         <div className="brand">
           <div className="logo"><Layers3 /></div>
           <div>
-            <span>MARS TERRAIN SYSTEM</span>
+            <span
+              className={`appVersion ${versionState}`}
+              title={versionState === 'outdated'
+                ? 'A newer main branch version is available'
+                : versionState === 'current'
+                  ? 'This build includes the latest main branch version'
+                  : versionState === 'checking'
+                    ? 'Checking the main branch version'
+                    : 'Unable to verify the main branch version'}
+              aria-live="polite"
+            >
+              MARS TERRAIN SYSTEM{' '}
+              <b className={`versionNumber ${versionState}`}>[{APP_VERSION}]</b>
+            </span>
             <h1>Ares Foundry</h1>
           </div>
         </div>
         <div className="headActions">
-          <button className="folder" onClick={() => demInput.current?.click()} title="Load MOLA" disabled={!!dem}>
-            <FileImage /><span>{dem ? 'MOLA loaded' : 'Load MOLA'}</span>
+          <button className="folder" onClick={() => demInput.current?.click()}
+            title={demReady ? dem : 'Load a global MOLA elevation GeoTIFF'} disabled={demLoading || running}>
+            <FileImage /><span>{demReady ? 'MOLA ready' : demLoading ? 'Loading DEM…' : 'Load MOLA'}</span>
           </button>
           <button className="folder" onClick={() => setConfigOpen(o => !o)} title="Generation settings">
             <Settings2 /><span>Settings</span>
@@ -918,7 +1054,7 @@ function App() {
         <div>
           <span className="eyebrow"><i /> LOCAL GENERATION PIPELINE</span>
           <h2>Forge the red planet,<br /><em>one chunk at a time.</em></h2>
-          <p>Deterministic cube-sphere terrain informed by NASA MOLA elevation characteristics. Generated entirely on your device.</p>
+          <p>Real Martian elevations sampled from MOLA and projected onto a seamless cube-sphere. Completed terrain tiles are cached locally in your browser.</p>
         </div>
         <div className="orbit">
           <Globe2 />
@@ -941,9 +1077,28 @@ function App() {
         <div>
           <button
             className="primary"
-            onClick={() => { sessionRef.current = true; setRunning(true); setPaused(false); }}
+            onClick={() => {
+              if (!demReady) {
+                setDemError('Load a global MOLA DEM before generating terrain.');
+                return;
+              }
+              sessionRef.current = true;
+              setRunning(true);
+              setPaused(false);
+              try {
+                if (navigator.storage?.persist) {
+                  void navigator.storage.persist().then(persistent => {
+                    if (!persistent) setCacheWarning('Browser storage is not persistent; cached tiles can be evicted if storage is cleared or under pressure.');
+                  }).catch(() => {});
+                }
+              } catch { /* cache remains best-effort */ }
+            }}
             disabled={(running && !paused) || !runnable}
-            title={!runnable ? 'This preset is too large to run in-browser — enable region export or pick a smaller preset' : ''}
+            title={!demReady
+              ? 'Load a global MOLA DEM before generating terrain'
+              : !runnable
+                ? 'This preset is too large to run in-browser — enable region export or pick a smaller preset'
+                : ''}
           >
             <Play /> {done ? 'Resume generation' : 'Begin generation'}
           </button>
@@ -967,6 +1122,19 @@ function App() {
           {' '}MARS binary · preset <b>{cfg.preset.label}</b>
         </span>
       </section>
+
+      {!demReady && !demLoading && !demError && (
+        <div className="configWarn info demNotice"><Database />
+          <span>Load the global MOLA GeoTIFF to enable terrain generation. The multi-gigabyte file is read by small raster windows, not loaded into memory all at once.</span>
+        </div>
+      )}
+      {demLoading && (
+        <div className="configWarn info demNotice"><RefreshCw className="spin" />
+          <span>{dem || 'Indexing MOLA raster windows…'}</span>
+        </div>
+      )}
+      {demError && <div className="configWarn demNotice"><AlertTriangle /><span>{demError}</span></div>}
+      {cacheWarning && <div className="configWarn demNotice"><HardDrive /><span>{cacheWarning}</span></div>}
 
       {pack.status !== 'idle' && (
         <div className="packBar">
@@ -1011,6 +1179,7 @@ function App() {
               <div className="chunkEnd">
                 <b>{c.status === 'complete' ? formatBytes(c.size) : c.status === 'generating' ? `${Math.round(c.progress * 100)}%` : '—'}</b>
                 <span>{c.status}</span>
+                {c.status === 'complete' && c.cached && <small className="cacheTag">from cache</small>}
               </div>
               {c.status === 'complete' && c.heights && (
                 <button
@@ -1038,7 +1207,7 @@ function App() {
       </section>
 
       <footer>
-        <Database /> NASA MOLA-inspired planetary model <span>•</span> All processing stays local
+        <Database /> Actual MOLA elevations · cached locally <span>•</span> All processing stays on-device
       </footer>
 
       {globe && <Globe chunks={chunks} nPerFace={queueNRef.current} onClose={() => setGlobe(false)} />}
@@ -1051,6 +1220,32 @@ function App() {
           focus={viewer.focus}
           onClose={closeViewer}
         />
+      )}
+
+      {mainUpdate && (
+        <div className="updateOverlay">
+          <section
+            className="updateDialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="update-dialog-title"
+            aria-describedby="update-dialog-description"
+          >
+            <span className="updateEyebrow">MAIN BRANCH UPDATE</span>
+            <h2 id="update-dialog-title">A newer version is available</h2>
+            <p id="update-dialog-description">
+              Main has {mainUpdate.aheadBy} newer commit{mainUpdate.aheadBy === 1 ? '' : 's'} than this build ({APP_VERSION}).
+              Reload the application to get the latest version.
+            </p>
+            <div className="updateActions">
+              <button className="updateCancel" onClick={() => {
+                dismissedMainRef.current = mainUpdate.mainSha;
+                setMainUpdate(null);
+              }}>Cancel</button>
+              <button className="updateReload" onClick={() => window.location.reload()}>Reload application</button>
+            </div>
+          </section>
+        </div>
       )}
     </main>
   );
