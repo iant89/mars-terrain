@@ -2,3 +2,6 @@ node_modules/
 dist/
 .DS_Store
 *.local
+# Local MOLA DEMs hosted beside the app (the USGS mosaic is ~2 GB).
+*.tif
+*.tiff

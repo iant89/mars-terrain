@@ -8,6 +8,13 @@
 // Every generated chunk is meshed. Chunks on the far side of the planet
 // (below the horizon) are hidden; everything else stays in the scene, so
 // orbiting never drops terrain that should be on the globe.
+//
+// Directions, tile centres and lat/lon are all kept in the geographic planet
+// frame (lon = atan2(z, x)); they cross into three.js scene space only
+// through planetToScene/sceneToPlanet, which flips the handedness so the
+// globe is drawn north-up with east on the right instead of mirrored. Camera
+// controls assume that: dragging right moves the terrain right (west-ward
+// camera motion), and in fly mode D moves the camera east.
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import * as THREE from 'three';
@@ -20,7 +27,8 @@ import { Vec3, faceDirVec } from './region';
 import {
   ShadeMode, TileIndex, TileRecord, TileRef,
   MATERIAL_LABELS, angleBetween, buildTileGeometry, localFrame,
-  materialHex, projectToPlanet, sampleTerrain, tileCenterDir, tileKey,
+  materialHex, planetToScene, projectToPlanet, sampleTerrain, sceneToPlanet,
+  tileCenterDir, tileKey,
 } from './terrain';
 
 // Hard cap on simultaneously resident tile meshes. Practical presets fit
@@ -102,14 +110,18 @@ function wrapLon(lon: number): number {
 }
 
 function applyGlobeCamera(camera: THREE.PerspectiveCamera, g: GlobeCam, surfaceElev = 0) {
-  const d = dirFromLatLon(g.lat, g.lon);
+  // Scene space, so the globe is drawn the right way round (east on the
+  // right); the camera's lat/lon stay in the planet frame.
+  const d = planetToScene(dirFromLatLon(g.lat, g.lon));
   // Altitude is height above the local surface, so a 1 km cruise clears Olympus
   // instead of burying the camera inside it.
   const r = MARS_RADIUS_M + surfaceElev + g.altitude;
   camera.position.set(d.x * r, d.y * r, d.z * r);
   const slat = Math.sin(g.lat), clat = Math.cos(g.lat);
   const clon = Math.cos(g.lon), slon = Math.sin(g.lon);
-  camera.up.set(-slat * clon, clat, -slat * slon);
+  // Local north, in scene space: screen up is north, so screen right is east.
+  const up = planetToScene({ x: -slat * clon, y: clat, z: -slat * slon });
+  camera.up.set(up.x, up.y, up.z);
   camera.lookAt(0, 0, 0);
   camera.near = Math.max(1, Math.min(g.altitude * 0.02, g.altitude * 0.25, 8_000));
   camera.far = r + MARS_RADIUS_M * 1.5;
@@ -233,9 +245,12 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
     const camera = cameraRef.current;
     if (!camera) return 0;
     const len = camera.position.length() || 1;
-    const cx = camera.position.x / len;
-    const cy = camera.position.y / len;
-    const cz = camera.position.z / len;
+    // Tile directions are planet-frame, so compare against the camera in the
+    // same frame rather than against its scene position.
+    const cam = sceneToPlanet(camera.position);
+    const cx = cam.x / len;
+    const cy = cam.y / len;
+    const cz = cam.z / len;
     // Horizon: a surface point is hidden once it dips behind the limb.
     const horizon = (MARS_RADIUS_M * 0.982) / len;
     let vis = 0;
@@ -444,7 +459,9 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
     const geoKey = `${N}|${p.resolution}|${p.exaggeration}|${p.shade}|${p.relief}|planet`;
     geoKeyRef.current = geoKey;
 
-    const cam = camera.position;
+    // Planet-frame camera position: `rec.dir` is planet-frame too, and the
+    // two must match or "nearest tile first" ranks the wrong hemisphere.
+    const cam = sceneToPlanet(camera.position);
     const ranked: { rec: TileRecord; d: number }[] = [];
     for (const rec of index.values()) {
       const d = Math.hypot(
@@ -664,6 +681,9 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
       // Grab-the-planet: one pixel matches the angular size of a pixel at
       // the surface under the camera, so altitude is unchanged while panning.
       const sens = (2 * Math.tan((camera.fov * DEG) / 2)) / hh;
+      // East is drawn on the right (planetToScene), so walking the camera west
+      // for a rightward drag is what carries the terrain right with the
+      // cursor; dragging down likewise walks it north.
       g.lat = clampLat(g.lat + dy * sens);
       g.lon = wrapLon(g.lon - dx * sens / Math.max(0.12, Math.cos(g.lat)));
     };
@@ -780,7 +800,11 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
         const az = p.sunAz * DEG;
         const sEl = Math.sin(p.sunEl * DEG);
         const cEl = Math.cos(p.sunEl * DEG);
-        sunRef.current.position.set(Math.sin(az) * cEl, sEl, -Math.cos(az) * cEl);
+        // The sun bearing is set over the planet, so place it in the planet
+        // frame and convert — otherwise un-mirroring the globe would light it
+        // from the opposite side.
+        const sunDir = planetToScene({ x: Math.sin(az) * cEl, y: sEl, z: -Math.cos(az) * cEl });
+        sunRef.current.position.set(sunDir.x, sunDir.y, sunDir.z);
         sunRef.current.position.multiplyScalar(MARS_RADIUS_M * 20);
         sunRef.current.intensity = 1.5 + 1.4 * Math.max(0, sEl);
       }
