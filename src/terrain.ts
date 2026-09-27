@@ -2,11 +2,9 @@
 //
 // Generated tiles live on the cube-sphere: a tile is a cube face plus an (x, y)
 // index into that face's N x N grid, holding res x res elevations in meters.
-// The renderer draws a *window* of tiles around a focus point in a local
-// tangent frame (east / north / up, in meters) so a camera can orbit or fly
-// over a patch of the planet at true scale — coordinates stay small (a few
-// hundred km at most) instead of planetary, which keeps float32 vertex
-// precision comfortable and lets the camera sit one metre off the ground.
+// The globe renderer places every vertex in planet-centered coordinates
+// (origin at the core, +Y north) so the mesh is an actual planet the camera
+// can orbit. A local tangent-frame projection remains for non-curved layouts.
 //
 // Everything here is pure math (no three.js): the renderer turns the returned
 // typed arrays into BufferGeometry attributes.
@@ -38,18 +36,40 @@ export function localFrame(dir: Vec3): Frame {
 }
 
 /**
- * Local scene coordinates: X = east, Y = up, Z = -north (so -Z faces north,
- * matching three.js' default camera orientation).
+ * Scene coordinates. In planet-centered mode the origin is the planet centre,
+ * +Y is north, and a surface point sits at `dir * (R + elevation)`. The older
+ * local-frame layout (X = east, Y = up, Z = -north) is still available when
+ * curvature is off.
  */
 export type LocalPoint = { x: number; y: number; z: number };
+
+/**
+ * Planet-centered position of a surface point: origin at the core, +Y north.
+ * Used by the globe renderer so the generated terrain actually looks like a
+ * planet rather than a tangent patch.
+ */
+export function projectToPlanet(
+  dir: Vec3,
+  elevationM: number,
+  exaggeration: number,
+): LocalPoint {
+  const r = MARS_RADIUS_M + elevationM * exaggeration;
+  return { x: dir.x * r, y: dir.y * r, z: dir.z * r };
+}
+
+/** Inverse of projectToPlanet: scene point -> unit direction from the core. */
+export function planetToDirection(p: LocalPoint): Vec3 {
+  return normVec(p);
+}
 
 /**
  * Project a surface point onto the local tangent frame.
  *
  * `curvature: false` uses an azimuthal-equidistant projection: distance from
  * the anchor is preserved (R * angle), the terrain is laid out flat and relief
- * reads clearly. `curvature: true` keeps the true sphere, so distant tiles drop
- * below the anchor's horizon.
+ * reads clearly. `curvature: true` is planet-centered (see projectToPlanet) so
+ * the whole sphere is in one coordinate system and distant tiles drop below
+ * the horizon.
  */
 export function projectToFrame(
   dir: Vec3,
@@ -58,16 +78,8 @@ export function projectToFrame(
   exaggeration: number,
   curvature: boolean,
 ): LocalPoint {
+  if (curvature) return projectToPlanet(dir, elevationM, exaggeration);
   const h = elevationM * exaggeration;
-  if (curvature) {
-    const r = MARS_RADIUS_M + h;
-    const p: Vec3 = {
-      x: dir.x * r - frame.up.x * MARS_RADIUS_M,
-      y: dir.y * r - frame.up.y * MARS_RADIUS_M,
-      z: dir.z * r - frame.up.z * MARS_RADIUS_M,
-    };
-    return { x: dot(p, frame.east), y: dot(p, frame.up), z: -dot(p, frame.north) };
-  }
   const c = Math.max(-1, Math.min(1, dot(dir, frame.up)));
   const w: Vec3 = {
     x: dir.x - frame.up.x * c,
@@ -83,14 +95,7 @@ export function projectToFrame(
 
 /** Inverse of projectToFrame (ignores the local height): local point -> unit direction. */
 export function frameToDirection(p: LocalPoint, frame: Frame, curvature: boolean): Vec3 {
-  if (curvature) {
-    const R = MARS_RADIUS_M;
-    return normVec({
-      x: frame.up.x * (R + p.y) + frame.east.x * p.x - frame.north.x * p.z,
-      y: frame.up.y * (R + p.y) + frame.east.y * p.x - frame.north.y * p.z,
-      z: frame.up.z * (R + p.y) + frame.east.z * p.x - frame.north.z * p.z,
-    });
-  }
+  if (curvature) return planetToDirection(p);
   const rho = Math.hypot(p.x, p.z);
   if (rho < 1e-9) return frame.up;
   const theta = rho / MARS_RADIUS_M;
@@ -382,17 +387,19 @@ export function buildTileGeometry(o: BuildTileOptions): TileGeometry {
       let nz = ax * by - ay * bx;
       const len = Math.hypot(nx, ny, nz) || 1;
       nx /= len; ny /= len; nz /= len;
-      if (ny < 0) { nx = -nx; ny = -ny; nz = -nz; }
 
-      // Lighting normal: scale the tilt away from the local vertical by the
-      // relief-shading factor. The vertical is +Y in the flat layout; with
-      // curvature on it's the radial direction at this vertex (so the planet's
-      // own curvature isn't exaggerated along with the relief).
+      // Lighting vertical: +Y in the flat layout; radial (outward) on the
+      // planet so southern-hemisphere tiles aren't flipped inside-out.
       let ux = 0, uy = 1, uz = 0;
       if (o.curvature) {
         const d = faceDirVec(face, -1 + (2 * (x + i / (res - 1))) / N, -1 + (2 * (y + j / (res - 1))) / N);
-        ux = dot(d, frame.east); uy = dot(d, frame.up); uz = -dot(d, frame.north);
+        ux = d.x; uy = d.y; uz = d.z;
       }
+      if (nx * ux + ny * uy + nz * uz < 0) { nx = -nx; ny = -ny; nz = -nz; }
+
+      // Lighting normal: scale the tilt away from the local vertical by the
+      // relief-shading factor. The planet's own curvature isn't exaggerated
+      // along with the relief.
       const nu = nx * ux + ny * uy + nz * uz;
       let lx = ux * nu + (nx - ux * nu) * boost;
       let ly = uy * nu + (ny - uy * nu) * boost;
@@ -410,12 +417,13 @@ export function buildTileGeometry(o: BuildTileOptions): TileGeometry {
 
       // Colour: palette by material / elevation, then a slope term that
       // darkens exposed rock on steep faces (dust settles on the flats).
+      const upness = Math.max(0, Math.min(1, nx * ux + ny * uy + nz * uz));
       let cr: number, cg: number, cb: number;
       if (o.shade === 'material' && materials && materials.length === count) {
         const c = MATERIAL_RGB[materials[src]] ?? MATERIAL_RGB[0];
         cr = c[0]; cg = c[1]; cb = c[2];
       } else if (o.shade === 'slope') {
-        const t = Math.max(0, Math.min(1, (1 - ny) * 2.2));
+        const t = Math.max(0, Math.min(1, (1 - upness) * 2.2));
         cr = SLOPE_A[0] + (SLOPE_B[0] - SLOPE_A[0]) * t;
         cg = SLOPE_A[1] + (SLOPE_B[1] - SLOPE_A[1]) * t;
         cb = SLOPE_A[2] + (SLOPE_B[2] - SLOPE_A[2]) * t;
@@ -423,7 +431,7 @@ export function buildTileGeometry(o: BuildTileOptions): TileGeometry {
         const c = elevationColor(h);
         cr = c[0]; cg = c[1]; cb = c[2];
       }
-      const shade = 0.68 + 0.32 * Math.max(0, Math.min(1, ny));
+      const shade = 0.68 + 0.32 * upness;
       colors[k] = cr * shade;
       colors[k + 1] = cg * shade;
       colors[k + 2] = cb * shade;
@@ -468,7 +476,11 @@ export function buildTileGeometry(o: BuildTileOptions): TileGeometry {
   for (let j = 0; j < res; j++) {
     for (let i = 0; i < res; i++) {
       const k = (j * res + i) * 3;
-      const d = Math.hypot(positions[k] - center.x, positions[k + 2] - center.z);
+      const d = Math.hypot(
+        positions[k] - center.x,
+        positions[k + 1] - center.y,
+        positions[k + 2] - center.z,
+      );
       if (d > extent) extent = d;
     }
   }
