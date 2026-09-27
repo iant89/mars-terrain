@@ -9,7 +9,7 @@ import {
 import * as THREE from 'three';
 import { Chunk } from './types';
 import { TerrainViewer } from './renderer';
-import { TileRef } from './terrain';
+import { TileRef, angleBetween, tileCenterDir } from './terrain';
 import {
   PRESETS, deriveConfig, formatBytes, formatMeters, fmt, Config, PRACTICAL_CHUNK_LIMIT,
 } from './config';
@@ -58,6 +58,11 @@ function makeInitialChunks(N: number, region: RegionSpec | null): Chunk[] {
   // runnable in-browser (theoretical presets would be millions/billions of
   // objects and would lock up the tab).
   if (6 * N * N > PRACTICAL_CHUNK_LIMIT) return [];
+  // Nearest-first from the queue's first tile (face 0, tile 0-0), matching the
+  // region-mode ordering: the play area around the start is ready in seconds
+  // and the frontier expands outward, so the 3D view keeps streaming new tiles
+  // while generation continues (a raster sweep would march off into the
+  // distance and leave the preview window starved).
   const out: Chunk[] = [];
   for (let face = 0; face < 6; face++) {
     for (let y = 0; y < N; y++) {
@@ -72,6 +77,11 @@ function makeInitialChunks(N: number, region: RegionSpec | null): Chunk[] {
       }
     }
   }
+  const origin = tileCenterDir(0, 0, 0, N);
+  const dist = new Map<string, number>();
+  for (const c of out) dist.set(c.id, angleBetween(origin, tileCenterDir(c.face, c.x, c.y, N)));
+  out.sort((a, b) =>
+    (dist.get(a.id)! - dist.get(b.id)!) || (a.face - b.face) || (a.y - b.y) || (a.x - b.x));
   return out;
 }
 
@@ -573,19 +583,16 @@ function App() {
   const [running, setRunning] = useState(false);
   const [paused, setPaused] = useState(false);
   const [globe, setGlobe] = useState(false);
-  // 3D terrain renderer: opened on demand, centred on a tile. The viewer polls
-  // the queue through getChunks, so a running generation never re-renders it.
+  // 3D terrain renderer: opened on demand. The viewer polls the queue through
+  // getChunks, so a running generation never re-renders it. A null focus means
+  // "live preview" mode: the renderer centres on the first completed tile and
+  // keeps up with the generation frontier, so new chunks keep streaming into
+  // the scene for the whole run. The eye button pins one explicit tile instead.
   const [viewer, setViewer] = useState<{ focus: TileRef | null } | null>(null);
   const getChunks = useCallback(() => chunksRef.current, []);
   const openViewer = useCallback((focus?: TileRef) => {
-    const tile = focus
-      ?? (regionEnabled && regionPlan ? regionPlan.center : null)
-      ?? (() => {
-        const first = chunksRef.current.find(c => c.status === 'complete' && c.heights);
-        return first ? { face: first.face, x: first.x, y: first.y } : null;
-      })();
-    setViewer({ focus: tile });
-  }, [regionEnabled, regionPlan]);
+    setViewer({ focus: focus ?? null });
+  }, []);
   const closeViewer = useCallback(() => setViewer(null), []);
   const [configOpen, setConfigOpen] = useState(false);
   const [dem, setDem] = useState<string>('');
