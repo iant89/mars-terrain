@@ -37,16 +37,40 @@ export function localFrame(dir: Vec3): Frame {
 
 /**
  * Scene coordinates. In planet-centered mode the origin is the planet centre,
- * +Y is north, and a surface point sits at `dir * (R + elevation)`. The older
- * local-frame layout (X = east, Y = up, Z = -north) is still available when
- * curvature is off.
+ * +Y is north, and a surface point sits at `planetToScene(dir) * (R + elevation)`.
+ * The older local-frame layout (X = east, Y = up, Z = -north) is still
+ * available when curvature is off.
  */
 export type LocalPoint = { x: number; y: number; z: number };
 
 /**
- * Planet-centered position of a surface point: origin at the core, +Y north.
- * Used by the globe renderer so the generated terrain actually looks like a
- * planet rather than a tangent patch.
+ * Planet frame -> renderer scene frame.
+ *
+ * The planet frame is geographic: +X at 0° N 0° E, +Y at the north pole and
+ * +Z at 0° N 90° E — that is exactly what `lon = atan2(z, x)` means for the
+ * cube-sphere tiles, the `.mars` headers and every lat/lon readout. In that
+ * frame the (east, north, up) triad is *left*-handed, so handing those
+ * coordinates straight to a right-handed renderer draws a mirror image of the
+ * planet: with north up, east ends up on the left of the screen. Mirrored
+ * geography also silently reverses horizontal camera motion — panning east
+ * moves the view left — while vertical motion still looks right.
+ *
+ * Negating Z restores the handedness for display only: north stays up, east
+ * is on the right, and the planet frame that the tiles and exports are
+ * defined in is left untouched. The map is its own inverse, so the same
+ * conversion goes both ways (see `sceneToPlanet`).
+ */
+export function planetToScene(v: Vec3): Vec3 {
+  return { x: v.x, y: v.y, z: -v.z };
+}
+
+/** Renderer scene frame -> planet frame. Same mirror as `planetToScene`. */
+export const sceneToPlanet = planetToScene;
+
+/**
+ * Planet-centered scene position of a surface point: origin at the core,
+ * +Y north, east to the right. Used by the globe renderer so the generated
+ * terrain actually looks like a planet rather than a tangent patch.
  */
 export function projectToPlanet(
   dir: Vec3,
@@ -54,12 +78,13 @@ export function projectToPlanet(
   exaggeration: number,
 ): LocalPoint {
   const r = MARS_RADIUS_M + elevationM * exaggeration;
-  return { x: dir.x * r, y: dir.y * r, z: dir.z * r };
+  const s = planetToScene(dir);
+  return { x: s.x * r, y: s.y * r, z: s.z * r };
 }
 
 /** Inverse of projectToPlanet: scene point -> unit direction from the core. */
 export function planetToDirection(p: LocalPoint): Vec3 {
-  return normVec(p);
+  return sceneToPlanet(normVec(p));
 }
 
 /**
@@ -389,10 +414,13 @@ export function buildTileGeometry(o: BuildTileOptions): TileGeometry {
       nx /= len; ny /= len; nz /= len;
 
       // Lighting vertical: +Y in the flat layout; radial (outward) on the
-      // planet so southern-hemisphere tiles aren't flipped inside-out.
+      // planet so southern-hemisphere tiles aren't flipped inside-out. The
+      // positions above are scene-space, so the radial must be too.
       let ux = 0, uy = 1, uz = 0;
       if (o.curvature) {
-        const d = faceDirVec(face, -1 + (2 * (x + i / (res - 1))) / N, -1 + (2 * (y + j / (res - 1))) / N);
+        const d = planetToScene(
+          faceDirVec(face, -1 + (2 * (x + i / (res - 1))) / N, -1 + (2 * (y + j / (res - 1))) / N),
+        );
         ux = d.x; uy = d.y; uz = d.z;
       }
       if (nx * ux + ny * uy + nz * uz < 0) { nx = -nx; ny = -ny; nz = -nz; }

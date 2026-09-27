@@ -38,7 +38,7 @@ Click **3D view** after a tile completes, or use the eye icon beside an individu
 - live latitude/longitude, elevation, altitude, material, tile, FPS, and triangle HUD data;
 - **Follow generation** to keep the newest completed tile centred, **Show whole planet** / **Cruise at 1 km**, and **Save PNG** for a screenshot.
 
-The renderer uses the same cube-sphere mapping and generated Float32 elevation grids as the `.mars` exporter, placed in planet-centered coordinates so the mesh is an actual globe the camera can orbit.
+The renderer uses the same cube-sphere mapping and generated Float32 elevation grids as the `.mars` exporter, placed in planet-centered coordinates so the mesh is an actual globe the camera can orbit. The globe is drawn the way it is mapped — north up, east to the right — so dragging right carries the terrain right with the cursor and fly-mode **D** moves the camera east.
 
 ## Region export (game streaming)
 
