@@ -13,7 +13,7 @@ Generated tiles never need an output directory: when a run finishes, the complet
 
 ## 3D renderer
 
-Click **3D view** after a tile completes, or use the eye icon beside an individual tile in **Complete**, to open the local terrain renderer. Completed height and material grids stream into the scene while generation continues. The renderer shows a bounded window around a selected tile so browser memory stays predictable — the **3D view** button centres it on the first completed tile, and the eye icon on a specific tile. The view stays where it is while chunks inside the window stream in; it only moves when you enable **Follow generation** or use **Center on nearest tile**. The renderer supports:
+Click **3D view** after a tile completes, or use the eye icon beside an individual tile in **Complete**, to open the local terrain renderer. Completed height and material grids stream into the scene while generation continues. The renderer shows a bounded window around a selected tile so browser memory stays predictable — the **3D view** button centres it on the first completed tile, and the eye icon on a specific tile. The view stays centred where it opened and, with **Grow with generation** on (the default), the window grows outward as chunks complete — up to a 900-tile budget — while the camera eases back to keep it in frame. Move the **Window radius** slider to switch to a fixed radius. The centre only moves when you enable **Follow generation** or use **Center on nearest tile**. The renderer supports:
 
 - orbit, pan, zoom, and a pointer-lock **Fly** camera with WASD/Q/E controls;
 - material, elevation, and slope shading, with adjustable vertical exaggeration;

@@ -85,6 +85,11 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
   const [shade, setShade] = useState<ShadeMode>('material');
   const [exaggeration, setExaggeration] = useState(2);
   const [radius, setRadius] = useState(4);
+  // Auto window: stay centred on the starting tile and grow outward with the
+  // generation frontier (up to MAX_TILES), so a run visibly fills in from one
+  // spot. Moving the radius slider switches to a fixed radius.
+  const [autoRadius, setAutoRadius] = useState(true);
+  const [effectiveRadius, setEffectiveRadius] = useState(0);
   const [curvature, setCurvature] = useState(false);
   const [wireframe, setWireframe] = useState(false);
   const [showGrid, setShowGrid] = useState(true);
@@ -134,6 +139,8 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
   // Cleared for good once the user drags, zooms or flies — until then the
   // camera keeps fitting itself to the growing/sliding window.
   const cameraTouchedRef = useRef(false);
+  // Orbit framing the render loop eases towards while the camera is untouched.
+  const fitGoalRef = useRef<{ distance: number; targetY: number } | null>(null);
 
   const orbitRef = useRef({ theta: 0.6, phi: 1.02, distance: 1000, target: new THREE.Vector3() });
   const flyRef = useRef({ pos: new THREE.Vector3(0, 5000, 2000), yaw: 0, pitch: -0.2 });
@@ -147,11 +154,11 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
   // React state so the three.js effect can stay mounted for the whole session.
   const paramsRef = useRef({
     shade, exaggeration, curvature, radius, sunAz, sunEl, wireframe, showGrid,
-    autoRotate, follow, mode, flySpeedIdx, nPerFace, resolution, focusTile, relief,
+    autoRotate, follow, mode, flySpeedIdx, nPerFace, resolution, focusTile, relief, autoRadius,
   });
   paramsRef.current = {
     shade, exaggeration, curvature, radius, sunAz, sunEl, wireframe, showGrid,
-    autoRotate, follow, mode, flySpeedIdx, nPerFace, resolution, focusTile, relief,
+    autoRotate, follow, mode, flySpeedIdx, nPerFace, resolution, focusTile, relief, autoRadius,
   };
 
   // --- window construction ---------------------------------------------------
@@ -200,19 +207,31 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
     const centerDir = tileCenterDir(center.face, center.x, center.y, N);
     const frame = localFrame(centerDir);
     const tileAngle = tileAngleRad(center.face, center.x, center.y, N);
-    const windowAngle = Math.min(Math.PI * 0.49, Math.max(tileAngle, p.radius * tileAngle));
+    const maxAngle = Math.PI * 0.49;
 
-    // Tiles inside the window, nearest first.
-    const candidates: { rec: TileRecord; d: number }[] = [];
+    // Every generated tile with its distance from the centre, nearest first.
+    const all: { rec: TileRecord; d: number }[] = [];
     for (const rec of index.values()) {
       const c = Math.max(-1, Math.min(1,
         rec.dir.x * centerDir.x + rec.dir.y * centerDir.y + rec.dir.z * centerDir.z));
-      const d = Math.acos(c);
-      if (d <= windowAngle) candidates.push({ rec, d });
+      all.push({ rec, d: Math.acos(c) });
     }
-    candidates.sort((a, b) =>
+    all.sort((a, b) =>
       a.d - b.d || a.rec.face - b.rec.face || a.rec.y - b.rec.y || a.rec.x - b.rec.x);
-    const chosen = candidates.slice(0, MAX_TILES);
+
+    // Fixed radius: a disc of `radius` tile-widths. Auto: everything generated
+    // so far (nearest MAX_TILES), so the window grows with the frontier while
+    // the centre stays put.
+    let windowAngle: number;
+    if (p.autoRadius) {
+      const within = all.filter(c => c.d <= maxAngle).slice(0, MAX_TILES);
+      const far = within.length ? within[within.length - 1].d : 0;
+      windowAngle = Math.min(maxAngle, Math.max(tileAngle, far + tileAngle * 0.01));
+    } else {
+      windowAngle = Math.min(maxAngle, Math.max(tileAngle, p.radius * tileAngle));
+    }
+    const chosen = all.filter(c => c.d <= windowAngle).slice(0, MAX_TILES);
+    setEffectiveRadius(Math.max(1, Math.round(windowAngle / tileAngle)));
     if (chosen.length === 0) {
       // Nothing generated inside the window yet — keep the empty state rather
       // than framing a camera around nothing.
@@ -221,7 +240,7 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
     }
     setEmpty(false);
 
-    const geoKey = `${N}|${res}|${p.exaggeration}|${p.curvature ? 1 : 0}|${p.shade}` +
+    const geoKey = `${N}|${res}|${p.exaggeration}|${p.curvature ? 1 : 0}|${p.shade}|${p.relief}` +
       `|${center.face}-${center.x}-${center.y}`;
     const neighbor = (f: number, x: number, y: number): Float32Array | null =>
       index.get(tileKey(f, x, y))?.heights ?? null;
@@ -240,8 +259,45 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
     const gridPoints: number[] = [];
     const corners = [[0, 0], [res - 1, 0], [res - 1, res - 1], [0, res - 1]] as const;
 
+    // Tile boundary outline, lifted slightly so it reads over the relief.
+    const pushGrid = (rec: TileRecord, extent: number) => {
+      const lift = Math.max(20, extent * 0.004);
+      for (let ci = 0; ci < 4; ci++) {
+        const [i0, j0] = corners[ci];
+        const [i1, j1] = corners[(ci + 1) % 4];
+        for (const [i, j] of [[i0, j0], [i1, j1]] as const) {
+          const u = -1 + (2 * (rec.x + i / (res - 1))) / N;
+          const v = -1 + (2 * (rec.y + j / (res - 1))) / N;
+          const h = (rec.heights[j * res + i] ?? 0) + lift / Math.max(0.001, p.exaggeration);
+          const pt = projectToFrame(faceDirVec(rec.face, u, v), h, frame, p.exaggeration, p.curvature);
+          gridPoints.push(pt.x, pt.y, pt.z);
+        }
+      }
+    };
+
     for (const { rec } of chosen) {
       const key = tileKey(rec.face, rec.x, rec.y);
+      // Skip tiles whose inputs haven't changed since their mesh was built:
+      // same window parameters, same height data and the same set of
+      // neighbours available for the edge normals. A growing window then only
+      // builds the newcomers and their immediate neighbours.
+      let nbrMask = 0;
+      for (let dy = -1, bit = 0; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++, bit++) {
+          if ((dx || dy) && index.has(tileKey(rec.face, rec.x + dx, rec.y + dy))) nbrMask |= 1 << bit;
+        }
+      }
+      const cached = meshesRef.current.get(key);
+      if (cached && cached.userData.geoKey === geoKey && cached.userData.heights === rec.heights &&
+        cached.userData.nbrMask === nbrMask && cached.userData.stats) {
+        const st = cached.userData.stats as { cx: number; cz: number; extent: number; mean: number };
+        const reach = Math.hypot(st.cx, st.cz) + st.extent;
+        if (reach > span) span = reach;
+        meanSum += st.mean;
+        pushGrid(rec, st.extent);
+        continue;
+      }
+
       const g = buildTileGeometry({
         face: rec.face,
         x: rec.x,
@@ -287,24 +343,14 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
         group.add(mesh);
         meshesRef.current.set(key, mesh);
       }
+      mesh.userData.heights = rec.heights;
+      mesh.userData.nbrMask = nbrMask;
+      mesh.userData.stats = { cx: g.center.x, cz: g.center.z, extent: g.extent, mean: g.meanElevation };
 
       const reach = Math.hypot(g.center.x, g.center.z) + g.extent;
       if (reach > span) span = reach;
       meanSum += g.meanElevation;
-
-      // Tile boundary outline, lifted slightly so it reads over the relief.
-      const lift = Math.max(20, g.extent * 0.004);
-      for (let ci = 0; ci < 4; ci++) {
-        const [i0, j0] = corners[ci];
-        const [i1, j1] = corners[(ci + 1) % 4];
-        for (const [i, j] of [[i0, j0], [i1, j1]] as const) {
-          const u = -1 + (2 * (rec.x + i / (res - 1))) / N;
-          const v = -1 + (2 * (rec.y + j / (res - 1))) / N;
-          const h = (rec.heights[j * res + i] ?? 0) + lift / Math.max(0.001, p.exaggeration);
-          const pt = projectToFrame(faceDirVec(rec.face, u, v), h, frame, p.exaggeration, p.curvature);
-          gridPoints.push(pt.x, pt.y, pt.z);
-        }
-      }
+      pushGrid(rec, g.extent);
     }
 
     const mean = chosen.length ? meanSum / chosen.length : 0;
@@ -346,6 +392,23 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
     const centerKey = `${N}|${center.face}-${center.x}-${center.y}`;
     const moved = framedKeyRef.current !== centerKey;
     const autoFit = !cameraTouchedRef.current;
+    // Growth of an unchanged window (same centre and grid) while the camera is
+    // untouched: ease the orbit towards the new framing in the render loop
+    // instead of snapping on every rebuild, so a filling window zooms out
+    // smoothly rather than jumping.
+    if (autoFit && !frameCamera && !moved && framedOnceRef.current && framedNRef.current === N) {
+      fitGoalRef.current = { distance: winSpan * 1.9, targetY: mean * p.exaggeration };
+      if (p.mode === 'orbit') {
+        // Not on screen: keep the fly camera's start pose in step with the window.
+        const ty = mean * p.exaggeration;
+        flyRef.current.pos.set(winSpan * 0.9, ty + winSpan * 0.35, winSpan * 1.1);
+        const d = new THREE.Vector3(0, ty, 0).sub(flyRef.current.pos).normalize();
+        flyRef.current.yaw = Math.atan2(d.x, -d.z);
+        flyRef.current.pitch = Math.asin(Math.max(-1, Math.min(1, d.y)));
+      }
+      return;
+    }
+    fitGoalRef.current = null;
     if (frameCamera || moved || autoFit) {
       const full = frameCamera || autoFit || !framedOnceRef.current || framedNRef.current !== N;
       framedKeyRef.current = centerKey;
@@ -369,7 +432,7 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
   // Rebuild on any change that alters geometry or the window contents.
   useEffect(() => {
     buildWindowRef.current(false);
-  }, [focusKey, radius, exaggeration, curvature, shade, relief, nPerFace, resolution]);
+  }, [focusKey, radius, autoRadius, exaggeration, curvature, shade, relief, nPerFace, resolution]);
 
   // Grid overlay / wireframe are cheap: apply without rebuilding geometry.
   useEffect(() => {
@@ -621,6 +684,15 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
       if (p.mode === 'orbit') {
         const o = orbitRef.current;
         if (p.autoRotate) o.theta += dt * 0.08;
+        const goal = fitGoalRef.current;
+        if (goal && cameraTouchedRef.current) fitGoalRef.current = null;
+        else if (goal) {
+          const k = 1 - Math.exp(-dt * 2.5);
+          o.distance += (goal.distance - o.distance) * k;
+          o.target.x += (0 - o.target.x) * k;
+          o.target.z += (0 - o.target.z) * k;
+          o.target.y += (goal.targetY - o.target.y) * k;
+        }
         const sinP = Math.sin(o.phi);
         camera.position.set(
           o.target.x + o.distance * sinP * Math.sin(o.theta),
@@ -882,9 +954,17 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
               <h3><Grid3x3 /> Visible tiles</h3>
               <label className="sliderRow">
                 <span>WINDOW RADIUS</span>
-                <b>{radius} tile{radius === 1 ? '' : 's'}</b>
-                <input type="range" min={1} max={MAX_RADIUS} step={1} value={radius}
-                  onChange={e => setRadius(Number(e.target.value))} />
+                <b>{autoRadius ? `auto · ${effectiveRadius}` : radius} tile{(autoRadius ? effectiveRadius : radius) === 1 ? '' : 's'}</b>
+                <input type="range" min={1} max={MAX_RADIUS} step={1}
+                  value={autoRadius ? Math.min(MAX_RADIUS, effectiveRadius) : radius}
+                  onChange={e => { setAutoRadius(false); setRadius(Number(e.target.value)); }} />
+              </label>
+              <label className="checkRow" title="Stay centred on the starting tile and grow the window outward as chunks complete (up to the tile budget)">
+                <input type="checkbox" checked={autoRadius} onChange={e => {
+                  if (!e.target.checked) setRadius(Math.max(1, Math.min(MAX_RADIUS, effectiveRadius)));
+                  setAutoRadius(e.target.checked);
+                }} />
+                <span>Grow with generation</span>
               </label>
               <label className="checkRow">
                 <input type="checkbox" checked={showGrid} onChange={e => setShowGrid(e.target.checked)} />
