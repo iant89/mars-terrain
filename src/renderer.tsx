@@ -93,6 +93,7 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
   const [mode, setMode] = useState<'orbit' | 'fly'>('orbit');
   const [sunAz, setSunAz] = useState(135);
   const [sunEl, setSunEl] = useState(32);
+  const [relief, setRelief] = useState(6);
   const [flySpeedIdx, setFlySpeedIdx] = useState(26);
   const [uiHidden, setUiHidden] = useState(false);
   const [focusTile, setFocusTile] = useState<TileRef | null>(focus);
@@ -146,11 +147,11 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
   // React state so the three.js effect can stay mounted for the whole session.
   const paramsRef = useRef({
     shade, exaggeration, curvature, radius, sunAz, sunEl, wireframe, showGrid,
-    autoRotate, follow, mode, flySpeedIdx, nPerFace, resolution, focusTile,
+    autoRotate, follow, mode, flySpeedIdx, nPerFace, resolution, focusTile, relief,
   });
   paramsRef.current = {
     shade, exaggeration, curvature, radius, sunAz, sunEl, wireframe, showGrid,
-    autoRotate, follow, mode, flySpeedIdx, nPerFace, resolution, focusTile,
+    autoRotate, follow, mode, flySpeedIdx, nPerFace, resolution, focusTile, relief,
   };
 
   // --- window construction ---------------------------------------------------
@@ -253,6 +254,7 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
         exaggeration: p.exaggeration,
         curvature: p.curvature,
         shade: p.shade,
+        reliefShading: p.relief,
         neighbor,
       });
 
@@ -367,7 +369,7 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
   // Rebuild on any change that alters geometry or the window contents.
   useEffect(() => {
     buildWindowRef.current(false);
-  }, [focusKey, radius, exaggeration, curvature, shade, nPerFace, resolution]);
+  }, [focusKey, radius, exaggeration, curvature, shade, relief, nPerFace, resolution]);
 
   // Grid overlay / wireframe are cheap: apply without rebuilding geometry.
   useEffect(() => {
@@ -912,6 +914,12 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
                 <b>{sunEl}°</b>
                 <input type="range" min={2} max={85} step={1} value={sunEl}
                   onChange={e => setSunEl(Number(e.target.value))} />
+              </label>
+              <label className="sliderRow" title="Exaggerates slopes in the lighting only (hillshade z-factor), so the sun direction reads on nearly flat terrain. 1× = true slopes.">
+                <span>RELIEF SHADING</span>
+                <b>{relief}×</b>
+                <input type="range" min={1} max={20} step={1} value={relief}
+                  onChange={e => setRelief(Number(e.target.value))} />
               </label>
             </section>
 

@@ -17,7 +17,7 @@ Click **3D view** after a tile completes, or use the eye icon beside an individu
 
 - orbit, pan, zoom, and a pointer-lock **Fly** camera with WASD/Q/E controls;
 - material, elevation, and slope shading, with adjustable vertical exaggeration;
-- optional planet curvature, tile-grid and wireframe overlays, and configurable sun azimuth/elevation;
+- optional planet curvature, tile-grid and wireframe overlays, and configurable sun azimuth/elevation, with a **Relief shading** factor (hillshade z-factor, lighting only) so the sun direction reads on terrain that is nearly flat at kilometre vertex spacing;
 - live latitude/longitude, elevation, material, tile, FPS, triangle, and span HUD data;
 - **Follow generation** to keep the newest completed tile centred and **Save PNG** for a screenshot.
 

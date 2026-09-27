@@ -294,6 +294,13 @@ export type BuildTileOptions = {
   exaggeration: number;
   curvature: boolean;
   shade: ShadeMode;
+  /**
+   * Relief shading (hillshade z-factor): exaggerates the terrain's slopes in
+   * the lighting normals only, leaving the geometry untouched. At vertex
+   * spacings of kilometres Mars is nearly flat, so without it the sun
+   * direction barely changes the image. 1 = physically true normals.
+   */
+  reliefShading?: number;
   /** Heights of a same-face neighbour tile, or null when it isn't available. */
   neighbor: (face: number, x: number, y: number) => Float32Array | null;
 };
@@ -347,6 +354,7 @@ export function buildTileGeometry(o: BuildTileOptions): TileGeometry {
     }
   }
 
+  const boost = Math.max(1, o.reliefShading ?? 1);
   const count = res * res;
   const positions = new Float32Array(count * 3);
   const normals = new Float32Array(count * 3);
@@ -375,9 +383,25 @@ export function buildTileGeometry(o: BuildTileOptions): TileGeometry {
       const len = Math.hypot(nx, ny, nz) || 1;
       nx /= len; ny /= len; nz /= len;
       if (ny < 0) { nx = -nx; ny = -ny; nz = -nz; }
-      normals[k] = nx;
-      normals[k + 1] = ny;
-      normals[k + 2] = nz;
+
+      // Lighting normal: scale the tilt away from the local vertical by the
+      // relief-shading factor. The vertical is +Y in the flat layout; with
+      // curvature on it's the radial direction at this vertex (so the planet's
+      // own curvature isn't exaggerated along with the relief).
+      let ux = 0, uy = 1, uz = 0;
+      if (o.curvature) {
+        const d = faceDirVec(face, -1 + (2 * (x + i / (res - 1))) / N, -1 + (2 * (y + j / (res - 1))) / N);
+        ux = dot(d, frame.east); uy = dot(d, frame.up); uz = -dot(d, frame.north);
+      }
+      const nu = nx * ux + ny * uy + nz * uz;
+      let lx = ux * nu + (nx - ux * nu) * boost;
+      let ly = uy * nu + (ny - uy * nu) * boost;
+      let lz = uz * nu + (nz - uz * nu) * boost;
+      const ll = Math.hypot(lx, ly, lz) || 1;
+      lx /= ll; ly /= ll; lz /= ll;
+      normals[k] = lx;
+      normals[k + 1] = ly;
+      normals[k + 2] = lz;
 
       const h = heights[src];
       if (h < minE) minE = h;
