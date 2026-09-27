@@ -13,16 +13,16 @@ Generated tiles never need an output directory: when a run finishes, the complet
 
 ## 3D renderer
 
-Click **3D view** after a tile completes, or use the eye icon beside an individual tile in **Complete**, to open the local terrain renderer. Completed height and material grids stream into the scene while generation continues. Tile selection is **viewport-driven**: every generated chunk inside the camera's view frustum and within the view distance is drawn, nearest first (bounded by a 2,600-tile budget), and chunks that leave the view are dropped — so you can pan, orbit or fly anywhere on the planet and the terrain appears around whatever you're looking at, instead of a fixed window around the opening tile. The **View distance** slider pins a fixed distance in tile-widths; with **Auto view distance** on (the default) it follows the camera zoom, with fog hiding the edge of what's drawn. The renderer supports:
+Click **3D view** after a tile completes, or use the eye icon beside an individual tile in **Complete**, to open the local terrain renderer. Completed height and material grids stream onto a real sphere while generation continues — the view is a planet, not a flat patch. The camera **orbits the planet**: drag to pan at a constant altitude, wheel to zoom from a 1 km cruise height out to a full-globe view. **Every generated chunk is drawn**; tiles on the far side of the globe stay hidden until you orbit them into view. The renderer supports:
 
-- orbit, pan, zoom, and a pointer-lock **Fly** camera with WASD/Q/E controls;
+- globe orbit / pan at constant altitude, wheel zoom (down to 1 km), and a **Fly** camera with WASD pan plus Q/E zoom;
 - material, elevation, and slope shading;
-- **true-scale relief by default** — every vertex is drawn at its actual elevation in metres (1 m up = 1 m across); the **Vertical scale** slider exaggerates relief on demand, and optional planet curvature drops distant terrain below the horizon;
+- **true-scale relief by default** — every vertex is drawn at its actual elevation in metres (1 m up = 1 m across); the **Vertical scale** slider exaggerates it on demand;
 - tile-grid and wireframe overlays, and configurable sun azimuth/elevation, with a **Relief shading** factor (hillshade z-factor, lighting only) so the sun direction reads on terrain that is nearly flat at kilometre vertex spacing;
-- live latitude/longitude, elevation, material, tile, FPS, triangle, and view-diameter HUD data;
-- **Follow generation** to keep the newest completed tile centred, **Recenter view** to fit the visible terrain, and **Save PNG** for a screenshot.
+- live latitude/longitude, elevation, altitude, material, tile, FPS, and triangle HUD data;
+- **Follow generation** to keep the newest completed tile centred, **Show whole planet** / **Cruise at 1 km**, and **Save PNG** for a screenshot.
 
-The renderer uses the same cube-sphere mapping and generated Float32 elevation grids as the `.mars` exporter. It builds shared-edge meshes in a local tangent frame that re-anchors to the camera's look point as you move, so a large planet-wide coordinate system is never needed — coordinates stay small and the flat layout stays accurate anywhere on the planet.
+The renderer uses the same cube-sphere mapping and generated Float32 elevation grids as the `.mars` exporter, placed in planet-centered coordinates so the mesh is an actual globe the camera can orbit.
 
 ## Region export (game streaming)
 
