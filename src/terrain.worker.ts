@@ -5,7 +5,7 @@ import { cacheTerrainTile, getCachedTerrainTile } from './terrain-cache';
 import { crc32Init, crc32Update, crc32Digest } from './zip';
 
 const ctx = self as unknown as DedicatedWorkerGlobalScope;
-const DEM_CACHE_VERSION = 'mola-v1';
+const DEM_CACHE_VERSION = 'mola-v2';
 const HEADER_BYTES = 24; // six little-endian uint32 values in the .mars header
 
 type Vec3 = { x: number; y: number; z: number };
@@ -18,6 +18,7 @@ type DemImage = {
   xSpan: number;
   yMin: number;
   yMax: number;
+  longitudeAtXMin: number;
   originX: number;
   originY: number;
   resX: number;
@@ -71,18 +72,39 @@ function globalRasterMetadata(image: GeoTIFFImage): Omit<DemImage, 'image' | 'no
   const resX = resolution[0];
   const resY = resolution[1];
 
-  // The terrain grid is a global, regular, geographic longitude/latitude DEM.
-  // This covers MOLA MEGDR GeoTIFFs and rejects projected/local rasters whose
-  // coordinates cannot be sampled safely with this mapping.
-  if (!bbox.every(Number.isFinite) || Math.abs(xSpan - 360) > 0.05 || Math.abs(ySpan - 180) > 0.05 ||
-      !Number.isFinite(resX) || !Number.isFinite(resY) || resX === 0 || resY === 0 ||
-      Math.abs(Math.abs(resX) * width - 360) > 0.1 ||
-      Math.abs(Math.abs(resY) * height - 180) > 0.1) {
-    throw new Error('Choose a global equirectangular Mars DEM covering 360° longitude and 180° latitude (such as the MOLA 463 m GeoTIFF).');
+  const centerX = (bbox[0] + bbox[2]) / 2;
+  const centerY = (bbox[1] + bbox[3]) / 2;
+  const finiteTransform = bbox.every(Number.isFinite) &&
+    Number.isFinite(origin[0]) && Number.isFinite(origin[1]) &&
+    Number.isFinite(resX) && Number.isFinite(resY) && resX !== 0 && resY !== 0;
+  const gridMatchesBounds = finiteTransform &&
+    Math.abs(Math.abs(resX) * width - xSpan) <= Math.max(0.1, xSpan * 1e-6) &&
+    Math.abs(Math.abs(resY) * height - ySpan) <= Math.max(0.1, ySpan * 1e-6);
+
+  // Some global DEMs store their georeferencing directly in longitude/latitude
+  // degrees. The USGS MOLA GeoTIFF instead uses a Mars simple-cylindrical
+  // (equirectangular) projection in metres: its global bounds are approximately
+  // ±πR by ±πR/2. Both describe the same 360° × 180° sampling grid.
+  const isGlobalGeographic = gridMatchesBounds &&
+    Math.abs(xSpan - 360) <= 0.05 && Math.abs(ySpan - 180) <= 0.05;
+  const radiusFromX = xSpan / (2 * Math.PI);
+  const radiusFromY = ySpan / Math.PI;
+  const projectedRadius = (radiusFromX + radiusFromY) / 2;
+  const projectedTolerance = projectedRadius * 0.005;
+  const isGlobalMarsEquirectangular = gridMatchesBounds &&
+    Math.abs(projectedRadius - MARS_RADIUS_M) <= MARS_RADIUS_M * 0.05 &&
+    Math.abs(radiusFromX - radiusFromY) <= projectedTolerance &&
+    Math.abs(centerX) <= projectedTolerance && Math.abs(centerY) <= projectedTolerance;
+
+  if (!isGlobalGeographic && !isGlobalMarsEquirectangular) {
+    throw new Error('Choose a global equirectangular Mars DEM covering 360° longitude and 180° latitude (such as the USGS MOLA 463 m GeoTIFF).');
   }
 
   return {
     width, height, xMin, xSpan, yMin, yMax,
+    // For projected MOLA, the left edge of the raster is longitude −180°;
+    // for a geographic raster it is the longitude coordinate at xMin.
+    longitudeAtXMin: isGlobalGeographic ? xMin : -180,
     originX: origin[0], originY: origin[1], resX, resY,
     pixelOffset: image.pixelIsArea() ? 0.5 : 0,
   };
@@ -101,7 +123,10 @@ async function sampleSourceFingerprint(image: GeoTIFFImage, metadata: Omit<DemIm
       hashB = Math.imul(hashB ^ (byte + 17), 0x85ebca6b) >>> 0;
     }
   };
-  for (const value of [metadata.width, metadata.height, metadata.originX, metadata.originY, metadata.resX, metadata.resY]) {
+  for (const value of [
+    metadata.width, metadata.height, metadata.xMin, metadata.xSpan, metadata.yMin, metadata.yMax,
+    metadata.longitudeAtXMin, metadata.originX, metadata.originY, metadata.resX, metadata.resY,
+  ]) {
     feed(Math.round(value * 1_000_000));
   }
   for (const fy of [0.11, 0.37, 0.63, 0.89]) {
@@ -166,10 +191,12 @@ function wrap(value: number, span: number): number {
 }
 
 function rasterCoordinates(d: DemImage, lat: number, lon: number): { col: number; row: number } {
-  const longitude = d.xMin + wrap(lon - d.xMin, d.xSpan);
-  const latitude = Math.max(d.yMin, Math.min(d.yMax, lat));
-  const col = (longitude - d.originX) / d.resX - d.pixelOffset;
-  const row = (latitude - d.originY) / d.resY - d.pixelOffset;
+  const longitudeOffset = wrap(lon - d.longitudeAtXMin, 360);
+  const x = d.xMin + (longitudeOffset / 360) * d.xSpan;
+  const latitude = Math.max(-90, Math.min(90, lat));
+  const y = d.yMin + ((latitude + 90) / 180) * (d.yMax - d.yMin);
+  const col = (x - d.originX) / d.resX - d.pixelOffset;
+  const row = (y - d.originY) / d.resY - d.pixelOffset;
   return { col, row: Math.max(0, Math.min(d.height - 1, row)) };
 }
 
