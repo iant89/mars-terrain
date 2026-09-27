@@ -154,7 +154,7 @@ function makeStarField(): THREE.Points {
 export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose }: TerrainViewerProps) {
   const mountRef = useRef<HTMLDivElement>(null);
 
-  const [shade, setShade] = useState<ShadeMode>('material');
+  const [shade, setShade] = useState<ShadeMode>('elevation');
   // 1 = true scale: every vertex sits at its actual elevation in metres.
   const [exaggeration, setExaggeration] = useState(1);
   const [wireframe, setWireframe] = useState(false);
@@ -981,11 +981,14 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
                 <button className={shade === 'slope' ? 'on' : ''} onClick={() => setShade('slope')}>Slope</button>
               </div>
               {shade === 'material' && (
-                <ul className="legend">
-                  {MATERIAL_LABELS.map((label, i) => (
-                    <li key={label}><i style={{ background: materialHex(i) }} />{label}</li>
-                  ))}
-                </ul>
+                <>
+                  <ul className="legend">
+                    {MATERIAL_LABELS.map((label, i) => (
+                      <li key={label}><i style={{ background: materialHex(i) }} />{label}</li>
+                    ))}
+                  </ul>
+                  <p className="hint">MOLA supplies elevations, not mineral or surface-material classifications.</p>
+                </>
               )}
               {shade === 'elevation' && (
                 <div className="ramp">

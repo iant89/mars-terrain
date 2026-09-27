@@ -217,9 +217,9 @@ export function sampleTerrain(
 
 export type ShadeMode = 'material' | 'elevation' | 'slope';
 
-// Material ids produced by the generator (see terrain.worker.ts).
-export const MATERIAL_LABELS = ['Plains', 'Highland', 'Lowland basin', 'Volcanic rock', 'Crater floor'];
-const MATERIAL_HEX = ['#a9603d', '#8d4a2f', '#b17a55', '#4f3c36', '#7d5942'];
+// MOLA is a topography-only DEM; it does not provide material classes.
+export const MATERIAL_LABELS = ['Unclassified MOLA surface'];
+const MATERIAL_HEX = ['#a9603d'];
 
 // Elevation ramp, low basins -> dusty summits.
 const ELEVATION_STOPS: [number, string][] = [

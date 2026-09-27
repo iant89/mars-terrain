@@ -4,7 +4,6 @@
 // Mars physical constants ----------------------------------------------------
 export const MARS_RADIUS_M = 3_389_500;           // mean radius (meters)
 export const CHUNK_RESOLUTION = 33;              // vertices per chunk edge (33 -> 1089 verts/chunk, 32 cells)
-export const VERTICAL_RANGE_M = 23_000;          // approximate vertical span of Martian topography (Olympus ~21 km)
 // ---------------------------------------------------------------------------
 
 export type ChunkPreset = {
@@ -17,8 +16,8 @@ export type ChunkPreset = {
 
 export const PRESETS: ChunkPreset[] = [
   { id: 'n16',  label: '16 × 16',   nPerFace: 16,  quality: 'Low',      description: 'Low — 1,536 chunks, fast preview.' },
-  { id: 'n32',  label: '32 × 32',   nPerFace: 32,  quality: 'Standard', description: 'Standard — 6,144 chunks, ~400 MB total output.' },
-  { id: 'n256', label: '256 × 256', nPerFace: 256, quality: 'High',     description: 'High — 393,216 chunks, ~25 GB. Requires disk streaming.' },
+  { id: 'n32',  label: '32 × 32',   nPerFace: 32,  quality: 'Standard', description: 'Standard — 6,144 chunks, ~32 MiB of raw tiles.' },
+  { id: 'n256', label: '256 × 256', nPerFace: 256, quality: 'High',     description: 'High — 393,216 chunks, ~2.0 GiB of raw tiles; region export is recommended.' },
 ];
 
 // Approximate threshold (number of chunks) beyond which in-browser generation
@@ -39,8 +38,8 @@ export type Config = {
   // roughly (2/√3) * R ≈ 1.1547 * R, while near corners it's ~R. We use the
   // face-center approximation for a single representative spacing value.
   sourceSpacingM: number;          // meters between adjacent vertices
-  sourceDepthM: number;            // vertical quantization step (VERTICAL_RANGE / 2^16 ≈ 0.35 m)
-  // Each .mars blob = 20 byte header + heights (Float32 * res^2) + materials (Uint8 * res^2)
+  sourceDepthM: number;            // MOLA elevation samples are stored in whole metres
+  // Each .mars blob = 24 byte header + heights (Float32 * res^2) + materials (Uint8 * res^2)
   bytesPerChunk: number;
   estimatedTotalBytes: number;     // bytesPerChunk * totalChunks
   practical: boolean;              // true if this preset can reasonably run in a browser
@@ -57,8 +56,8 @@ export function deriveConfig(preset: ChunkPreset): Config {
   // Face edge on the cube face (tangent plane): s = (2/sqrt(3)) * R  (central spacing)
   const faceEdgeM = (2 / Math.sqrt(3)) * MARS_RADIUS_M;
   const sourceSpacingM = faceEdgeM / (n * cellsPerChunkEdge);
-  const sourceDepthM = VERTICAL_RANGE_M / 65536;
-  const bytesPerChunk = 20 + verticesPerChunk * 4 + verticesPerChunk * 1; // header + Float32 + Uint8
+  const sourceDepthM = 1;
+  const bytesPerChunk = 24 + verticesPerChunk * 4 + verticesPerChunk; // header + Float32 elevations + Uint8 materials
   const estimatedTotalBytes = bytesPerChunk * totalChunks;
   return {
     preset,

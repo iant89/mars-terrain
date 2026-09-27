@@ -1,6 +1,6 @@
 # Ares Foundry — browser Mars terrain generator
 
-A responsive, local-first terrain generation dashboard. Terrain tiles are generated in a Web Worker at 33 × 33 vertices, using 2.29 m source spacing and a 73.1 m source depth and exported as compact `.mars` binaries containing a header, Float32 elevation grid, and material map.
+A responsive, local-first dashboard that samples real Mars elevations from MOLA onto a cube-sphere grid. Terrain tiles are sampled in a Web Worker at 33 × 33 vertices and exported as compact `.mars` binaries containing a header, Float32 elevation grid, and an unclassified material map.
 
 ## Run
 
@@ -10,6 +10,22 @@ npm run dev
 ```
 
 Generated tiles never need an output directory: when a run finishes, the completed `.mars` files are packaged into zip archives and downloaded by the browser automatically (or on demand via **Download ZIP**). When the file count or overall size is large, the set is split into multiple archives named `<name>_PART-1.zip`, `<name>_PART-2.zip`, …; a small set is delivered as a single `<name>.zip`. Individual tiles can still be downloaded from the Complete queue.
+
+## Real Mars elevation data
+
+Terrain generation uses a global, geographic MOLA GeoTIFF rather than procedural noise or synthetic craters. Download the [USGS MGS MOLA 463 m global DEM](https://astrogeology.usgs.gov/search/map/mars_mgs_mola_dem_463m) and choose it with **Load MOLA**. The source is about 2 GB; it is never read into one giant array. The worker requests and decodes only the small TIFF windows needed for each cube-sphere tile. If the same TIFF is hosted beside the app, it is opened with HTTP byte-range requests instead of downloading the whole file first.
+
+Completed `.mars` tiles are persisted in IndexedDB and reused when the same DEM, resolution, and tile are generated again. The browser may require enough persistent storage for the generated outputs; the high-density, planet-wide preset is about 2 GiB of raw tiles, so region export is more practical for most browsers. Local-file selections may need to be selected again after a browser restart so the app can identify the source and restore its cached tiles.
+
+## Headless Chromium
+
+On Linux, install Chromium for headless browser use with the repository helper. It uses the system package manager (apt, dnf, yum, pacman, or apk) and does not install project or browser-automation packages:
+
+```bash
+scripts/setup-deps.sh
+```
+
+To verify without installing, run `scripts/setup-deps.sh --check`. The script honors `PLAYWRIGHT_CHROMIUM=/path/to/chromium` when a browser has already been provisioned elsewhere.
 
 ## 3D renderer
 
@@ -28,4 +44,4 @@ The renderer uses the same cube-sphere mapping and generated Float32 elevation g
 
 **Settings → Starting position** restricts the job to the chunks around a starting position and discards the rest — nothing outside the region is ever generated. The queue generates nearest-to-spawn first, so the play area is ready in seconds and the outer ring finishes just as the player needs it; a game engine can build the remaining chunks on demand as the player approaches the outer edge, just before the missing ones would come into view. Planet-wide queues use the same nearest-first ordering (from the queue's first tile), so the 3D preview fills its window ring by ring instead of sweeping away from it. Region mode scales with the region rather than the planet, so even the ultra-high-density presets become runnable for a local play area. Regions are planned on the cube-sphere tile grid (`F#-x-y`) from latitude/longitude plus a radius in tiles, so the saved set matches the `.mars` headers the engine consumes.
 
-The cube-sphere procedural model follows the supplied generator's Mars-specific architecture and NASA MOLA-informed planetary characteristics: hemispheric crustal dichotomy, Tharsis-style uplift, Valles-style incision, multi-scale impact cratering, and seamless absolute 3D sampling. It does not bundle or claim to reproduce NASA's full MOLA raster dataset.
+The cube-sphere mesh samples MOLA elevations directly, so craters, basins, and volcanic features are present where they occur in the DEM rather than being synthetically placed. The app does not include a material-composition layer; its material view is marked unclassified.

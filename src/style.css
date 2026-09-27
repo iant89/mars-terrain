@@ -123,3 +123,26 @@
   .viewerHud{min-width:0;font-size:9px;padding:9px 11px}
   .viewerHint{display:none}
 }
+
+/* Build version and update prompt */
+.brand .appVersion{display:inline-block;font-family:'DM Mono';font-size:10px;letter-spacing:2px;color:#9a8e85}
+.brand .versionNumber{font:inherit;font-weight:500;transition:color .2s ease}
+.brand .versionNumber.current{color:#70a986}
+.brand .versionNumber.outdated{color:#e35b55}
+.brand .versionNumber.checking,.brand .versionNumber.unknown{color:#9a8e85}
+.updateOverlay{position:fixed;inset:0;z-index:100;display:grid;place-items:center;padding:24px;background:#080708d9;backdrop-filter:blur(5px)}
+.updateDialog{width:min(100%,480px);padding:34px;background:linear-gradient(145deg,#211718,#151314 70%);border:1px solid #c95c4b66;box-shadow:0 24px 90px #000b}
+.updateEyebrow{font-family:'DM Mono';font-size:9px;letter-spacing:2px;color:#e35b55}
+.updateDialog h2{margin:12px 0;font-size:25px;letter-spacing:-.6px}
+.updateDialog p{margin:0;color:#a39a94;font-size:13px;line-height:1.8}
+.updateActions{display:flex;justify-content:flex-end;gap:10px;margin-top:28px}
+.updateActions button{min-height:42px;padding:0 17px;border-radius:3px;font-size:12px}
+.updateCancel{border:1px solid #ffffff24;background:#ffffff08;color:#c8b8ad}
+.updateReload{border:1px solid #ca5c44;background:#b94a35;color:#fff}
+.updateActions button:hover{filter:brightness(1.15)}
+@media(max-width:800px){header{height:auto;min-height:100px;gap:12px;flex-wrap:wrap;padding:12px 0}.brand .appVersion{font-size:9px;letter-spacing:1px}}
+@media(max-width:600px){.updateDialog{padding:26px}.updateDialog h2{font-size:21px}.updateActions{flex-direction:column-reverse}.updateActions button{width:100%}}
+
+.demNotice{max-width:none;margin:-10px 0 16px}
+.demNotice .spin{animation:packSpin 1s linear infinite}
+.chunkEnd .cacheTag{font-family:'DM Mono';font-size:8px;letter-spacing:.8px;text-transform:uppercase;color:#70a986}

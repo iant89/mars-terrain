@@ -1,23 +1,375 @@
 /// <reference lib="webworker" />
-// Browser port of the supplied mars-terrain-gen analytic Stage B modules:
-// cubeSphere, noise/{hash,gradient3}, geology/{craters3,dichotomy3,volcanic3}.
-import {crc32Init,crc32Update,crc32Digest} from './zip';
-const ctx=self as unknown as DedicatedWorkerGlobalScope; let stopped=false;
-type V={x:number;y:number;z:number};
-const R=3_389_500,SEED=1337;
-// Output grid per chunk (vertices per edge) and per-chunk physical cell size
-// are supplied by the UI via postMessage (res / chunks); constants below are
-// planetary only.
-const norm=(p:V)=>{const l=Math.hypot(p.x,p.y,p.z)||1;return{x:p.x/l,y:p.y/l,z:p.z/l}},dist=(a:V,b:V)=>Math.hypot(a.x-b.x,a.y-b.y,a.z-b.z),dot=(a:V,b:V)=>a.x*b.x+a.y*b.y+a.z*b.z;
-function faceDir(face:number,u:number,v:number):V{let p:V;if(face===0)p={x:1,y:v,z:-u};else if(face===1)p={x:-1,y:v,z:u};else if(face===2)p={x:u,y:1,z:-v};else if(face===3)p={x:u,y:-1,z:v};else if(face===4)p={x:u,y:v,z:1};else p={x:-u,y:v,z:-1};const{x,y,z}=p,x2=x*x,y2=y*y,z2=z*z;return norm({x:x*Math.sqrt(1-y2/2-z2/2+y2*z2/3),y:y*Math.sqrt(1-z2/2-x2/2+z2*x2/3),z:z*Math.sqrt(1-x2/2-y2/2+x2*y2/3)})}
-function hash3(x:number,y:number,z:number,seed:number){let h=(x|0)*374761393+(y|0)*668265263+(z|0)*2147483647+(seed|0)*3266489917;h=(h^(h>>>13))*1274126177;h^=h>>>16;return((h>>>0)%1_000_000)/1_000_000}
-const grads=[[1,1,0],[-1,1,0],[1,-1,0],[-1,-1,0],[1,0,1],[-1,0,1],[1,0,-1],[-1,0,-1],[0,1,1],[0,-1,1],[0,1,-1],[0,-1,-1]];
-function perlin(x:number,y:number,z:number,seed:number){const x0=Math.floor(x),y0=Math.floor(y),z0=Math.floor(z),sx=x-x0,sy=y-y0,sz=z-z0,f=(t:number)=>t*t*t*(t*(t*6-15)+10),l=(a:number,b:number,t:number)=>a+(b-a)*t,g=(ix:number,iy:number,iz:number)=>{const q=grads[Math.floor(hash3(ix,iy,iz,seed)*12)%12];return q[0]*(x-ix)+q[1]*(y-iy)+q[2]*(z-iz)},u=f(sx),v=f(sy),w=f(sz);const a=l(g(x0,y0,z0),g(x0+1,y0,z0),u),b=l(g(x0,y0+1,z0),g(x0+1,y0+1,z0),u),c=l(g(x0,y0,z0+1),g(x0+1,y0,z0+1),u),d=l(g(x0,y0+1,z0+1),g(x0+1,y0+1,z0+1),u);return l(l(a,b,v),l(c,d,v),w)}
-function fbm(x:number,y:number,z:number,seed:number,oct=4,freq=1){let sum=0,n=0,a=1;for(let o=0;o<oct;o++){sum+=perlin(x*freq,y*freq,z*freq,seed+o*101)*a;n+=a;freq*=2;a*=.5}return sum/n}
-const craterScales=[[500000,40000,220000,.05,.015],[50000,3000,20000,.12,.06],[5000,150,1800,.18,.09]];
-function craters(p:V){let delta=0,inside=false;for(const[cs,min,max,depth,rim]of craterScales){const ix=Math.floor(p.x/cs),iy=Math.floor(p.y/cs),iz=Math.floor(p.z/cs);for(let ox=-1;ox<=1;ox++)for(let oy=-1;oy<=1;oy++)for(let oz=-1;oz<=1;oz++){const x=ix+ox,y=iy+oy,z=iz+oz,s=SEED^(cs|0);if(hash3(x,y,z,s*7+1)>.55)continue;const center={x:(x+.5)*cs+(hash3(x,y,z,s*7+2)-.5)*cs,y:(y+.5)*cs+(hash3(x,y,z,s*7+3)-.5)*cs,z:(z+.5)*cs+(hash3(x,y,z,s*7+4)-.5)*cs},id=Math.floor(hash3(x,y,z,s*7+5)*1e9),radius=min+hash3(id,0,0,SEED)*(max-min),dn=dist(p,center)/radius;if(dn>=2.2)continue;const age=hash3(id,1,0,SEED),sharp=1-age*.7,dr=depth*(.6+.4*hash3(id,3,0,SEED)),rr=rim*(.6+.4*hash3(id,4,0,SEED));let profile=0;if(dn<=1){profile=-dr*(1-dn*dn)*(.6+.4*sharp);if(radius>8000&&hash3(id,2,0,SEED)>.5&&dn<.25)profile+=dr*.5*(1-dn/.25)*sharp;if(dn>.75)profile+=rr*Math.sin((dn-.75)/.25*Math.PI)*sharp;inside=true}else profile=rr*(1-(dn-1)/1.2)**2*.5*sharp;delta+=profile*radius}}return{delta,inside}}
-const axis=norm({x:.2,y:.95,z:.1}),volCenter={x:-.303045763*R,y:.505076272*R,z:.808122036*R};
-function analytic(d:V){const p={x:d.x*R,y:d.y*R,z:d.z*R};const wx=d.x*4+fbm(d.x*2,d.y*2,d.z*2,SEED+7)*.25,wy=d.y*4+fbm(d.x*2+31.7,d.y*2-17.3,d.z*2+11.1,SEED+13)*.25,wz=d.z*4+fbm(d.x*2-9.4,d.y*2+5.2,d.z*2-21.6,SEED+19)*.25;const wander=fbm(wx*.6,wy*.6,wz*.6,SEED+1)*.3;let h=Math.tanh((dot(d,axis)-.15+wander)*3)*2000+fbm(d.x*6,d.y*6,d.z*6,SEED+2,5)*800;const a={x:R*.6,y:R*.3,z:R*.7},b={x:R*.9,y:R*.1,z:R*.4},ab={x:b.x-a.x,y:b.y-a.y,z:b.z-a.z},ap={x:p.x-a.x,y:p.y-a.y,z:p.z-a.z};let t=Math.max(0,Math.min(1,dot(ap,ab)/dot(ab,ab))),q={x:a.x+ab.x*t,y:a.y+ab.y*t,z:a.z+ab.z*t},cd=dist(p,q),width=100000*(1+fbm(p.x*.00004,p.y*.00004,p.z*.00004,SEED+9,3)*.4);if(cd<width)h+=-6000*(1-(cd/width)**2.2)*Math.min(1,Math.min(t,1-t)*8);const c=craters(p);h+=c.delta;const vd=dist(p,volCenter),vt=vd/300000;let volcano=0;if(vd<390000){volcano=21000*Math.max(0,1-vt)**1.6;if(vd<40000)volcano-=3000*(1-(vd/40000)**2);volcano+=fbm(p.x*.00005,p.y*.00005,p.z*.00005,542)*420*Math.max(0,1-vt);h+=volcano}return{h,mat:c.inside?4:volcano>200?3:h<-1500?2:fbm(p.x*.00003,p.y*.00003,p.z*.00003,SEED+77,3)>.3?1:0}}
-ctx.onmessage=(e:MessageEvent)=>{if(e.data.type==='stop'){stopped=true;return}stopped=false;const{id,face,cx,cy,res,chunks}=e.data,heights=new Float32Array(res*res),materials=new Uint8Array(res*res);for(let j=0;j<res;j++){for(let i=0;i<res;i++){if(stopped)return;const d=faceDir(face,-1+2*(cx+i/(res-1))/chunks,-1+2*(cy+j/(res-1))/chunks),s=analytic(d);heights[j*res+i]=s.h;materials[j*res+i]=s.mat}if(j%4===0)ctx.postMessage({type:'progress',id,progress:j/(res-1)})}const header=new Uint32Array([0x4d415253,1,face,cx,cy,res]);let crcState=crc32Init();crcState=crc32Update(crcState,new Uint8Array(header.buffer));crcState=crc32Update(crcState,new Uint8Array(heights.buffer));crcState=crc32Update(crcState,new Uint8Array(materials.buffer));const crc=crc32Digest(crcState);const blob=new Blob([header,heights,materials],{type:'application/octet-stream'});// The blob copies its parts up front, so both grids can be transferred to the
-// main thread (zero-copy) — the renderer keeps them for the 3D view.
-ctx.postMessage({type:'done',id,blob,heights,materials,crc},[heights.buffer,materials.buffer])};
+import { fromBlob, fromUrl, type GeoTIFF, type GeoTIFFImage } from 'geotiff';
+import { MARS_RADIUS_M } from './config';
+import { cacheTerrainTile, getCachedTerrainTile } from './terrain-cache';
+import { crc32Init, crc32Update, crc32Digest } from './zip';
+
+const ctx = self as unknown as DedicatedWorkerGlobalScope;
+const DEM_CACHE_VERSION = 'mola-v1';
+const HEADER_BYTES = 24; // six little-endian uint32 values in the .mars header
+
+type Vec3 = { x: number; y: number; z: number };
+type RasterValues = ArrayLike<number> & { width: number; height: number };
+type DemImage = {
+  image: GeoTIFFImage;
+  width: number;
+  height: number;
+  xMin: number;
+  xSpan: number;
+  yMin: number;
+  yMax: number;
+  originX: number;
+  originY: number;
+  resX: number;
+  resY: number;
+  pixelOffset: number;
+  noData: number | null;
+};
+
+let sourceTiff: GeoTIFF | null = null;
+let dem: DemImage | null = null;
+let sourceKey = '';
+let sourceRevision = 0;
+let generationRevision = 0;
+let cacheReadDisabled = false;
+let cacheWriteDisabled = false;
+
+function norm(p: Vec3): Vec3 {
+  const length = Math.hypot(p.x, p.y, p.z) || 1;
+  return { x: p.x / length, y: p.y / length, z: p.z / length };
+}
+
+function faceDirection(face: number, u: number, v: number): Vec3 {
+  let p: Vec3;
+  if (face === 0) p = { x: 1, y: v, z: -u };
+  else if (face === 1) p = { x: -1, y: v, z: u };
+  else if (face === 2) p = { x: u, y: 1, z: -v };
+  else if (face === 3) p = { x: u, y: -1, z: v };
+  else if (face === 4) p = { x: u, y: v, z: 1 };
+  else p = { x: -u, y: v, z: -1 };
+  const { x, y, z } = p;
+  const x2 = x * x, y2 = y * y, z2 = z * z;
+  return norm({
+    x: x * Math.sqrt(1 - y2 / 2 - z2 / 2 + (y2 * z2) / 3),
+    y: y * Math.sqrt(1 - z2 / 2 - x2 / 2 + (z2 * x2) / 3),
+    z: z * Math.sqrt(1 - x2 / 2 - y2 / 2 + (x2 * y2) / 3),
+  });
+}
+
+function globalRasterMetadata(image: GeoTIFFImage): Omit<DemImage, 'image' | 'noData'> {
+  const width = image.getWidth();
+  const height = image.getHeight();
+  const bbox = image.getBoundingBox();
+  const origin = image.getOrigin();
+  const resolution = image.getResolution();
+  const xMin = Math.min(bbox[0], bbox[2]);
+  const xMax = Math.max(bbox[0], bbox[2]);
+  const yMin = Math.min(bbox[1], bbox[3]);
+  const yMax = Math.max(bbox[1], bbox[3]);
+  const xSpan = xMax - xMin;
+  const ySpan = yMax - yMin;
+  const resX = resolution[0];
+  const resY = resolution[1];
+
+  // The terrain grid is a global, regular, geographic longitude/latitude DEM.
+  // This covers MOLA MEGDR GeoTIFFs and rejects projected/local rasters whose
+  // coordinates cannot be sampled safely with this mapping.
+  if (!bbox.every(Number.isFinite) || Math.abs(xSpan - 360) > 0.05 || Math.abs(ySpan - 180) > 0.05 ||
+      !Number.isFinite(resX) || !Number.isFinite(resY) || resX === 0 || resY === 0 ||
+      Math.abs(Math.abs(resX) * width - 360) > 0.1 ||
+      Math.abs(Math.abs(resY) * height - 180) > 0.1) {
+    throw new Error('Choose a global equirectangular Mars DEM covering 360° longitude and 180° latitude (such as the MOLA 463 m GeoTIFF).');
+  }
+
+  return {
+    width, height, xMin, xSpan, yMin, yMax,
+    originX: origin[0], originY: origin[1], resX, resY,
+    pixelOffset: image.pixelIsArea() ? 0.5 : 0,
+  };
+}
+
+async function sampleSourceFingerprint(image: GeoTIFFImage, metadata: Omit<DemImage, 'image' | 'noData'>): Promise<string> {
+  // A few tiny reads identify the actual raster contents without hashing or
+  // loading the multi-gigabyte source. The source metadata is mixed in as well.
+  let hashA = 0x811c9dc5;
+  let hashB = 0x9e3779b9;
+  const feed = (value: number) => {
+    const word = Number.isFinite(value) ? Math.trunc(value) >>> 0 : 0xffffffff;
+    for (let shift = 0; shift < 32; shift += 8) {
+      const byte = (word >>> shift) & 0xff;
+      hashA = Math.imul(hashA ^ byte, 0x01000193) >>> 0;
+      hashB = Math.imul(hashB ^ (byte + 17), 0x85ebca6b) >>> 0;
+    }
+  };
+  for (const value of [metadata.width, metadata.height, metadata.originX, metadata.originY, metadata.resX, metadata.resY]) {
+    feed(Math.round(value * 1_000_000));
+  }
+  for (const fy of [0.11, 0.37, 0.63, 0.89]) {
+    for (const fx of [0.09, 0.33, 0.67, 0.91]) {
+      const x = Math.max(0, Math.min(metadata.width - 2, Math.floor(fx * metadata.width)));
+      const y = Math.max(0, Math.min(metadata.height - 2, Math.floor(fy * metadata.height)));
+      const sample = await image.readRasters({
+        window: [x, y, x + 2, y + 2], samples: [0], interleave: true,
+      }) as unknown as RasterValues;
+      for (let i = 0; i < sample.length; i++) feed(sample[i]);
+    }
+  }
+  return `${hashA.toString(16).padStart(8, '0')}${hashB.toString(16).padStart(8, '0')}`;
+}
+
+async function openDem(message: any): Promise<void> {
+  const revision = ++sourceRevision;
+  generationRevision++;
+  ctx.postMessage({ type: 'dem-loading', sourceId: message.sourceId, name: message.name });
+  try {
+    const nextTiff = message.kind === 'blob'
+      ? await fromBlob(message.blob as Blob)
+      : await fromUrl(message.url as string, {
+          allowFullFile: false,
+          blockSize: 128 * 1024,
+          cacheSize: 32,
+        } as any);
+    const image = await nextTiff.getImage(0);
+    const metadata = globalRasterMetadata(image);
+    const rasterFingerprint = await sampleSourceFingerprint(image, metadata);
+    if (revision !== sourceRevision) {
+      nextTiff.close();
+      return;
+    }
+
+    sourceTiff?.close();
+    sourceTiff = nextTiff;
+    dem = { ...metadata, image, noData: image.getGDALNoData() };
+    sourceKey = `mola-${metadata.width}x${metadata.height}-${rasterFingerprint}`;
+    // The TIFF reader defaults to not retaining decoded raster blocks. Keep it
+    // that way: each terrain tile reads only its small source window.
+    ctx.postMessage({
+      type: 'dem-ready', sourceId: message.sourceId, name: message.name,
+      width: metadata.width, height: metadata.height, sourceKey,
+    });
+  } catch (error) {
+    if (revision === sourceRevision) {
+      dem = null;
+      sourceKey = '';
+      sourceTiff?.close();
+      sourceTiff = null;
+      ctx.postMessage({
+        type: 'dem-error', sourceId: message.sourceId,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+}
+
+function wrap(value: number, span: number): number {
+  return ((value % span) + span) % span;
+}
+
+function rasterCoordinates(d: DemImage, lat: number, lon: number): { col: number; row: number } {
+  const longitude = d.xMin + wrap(lon - d.xMin, d.xSpan);
+  const latitude = Math.max(d.yMin, Math.min(d.yMax, lat));
+  const col = (longitude - d.originX) / d.resX - d.pixelOffset;
+  const row = (latitude - d.originY) / d.resY - d.pixelOffset;
+  return { col, row: Math.max(0, Math.min(d.height - 1, row)) };
+}
+
+async function readRasterWindow(d: DemImage, startCol: number, endCol: number, startRow: number, endRow: number): Promise<{
+  startCol: number; startRow: number; first: RasterValues; second: RasterValues | null; firstWidth: number;
+}> {
+  const count = endCol - startCol + 1;
+  const normalizedStart = wrap(startCol, d.width);
+  const firstWidth = Math.min(count, d.width - normalizedStart);
+  const first = await d.image.readRasters({
+    window: [normalizedStart, startRow, normalizedStart + firstWidth, endRow + 1],
+    samples: [0], interleave: true,
+  }) as unknown as RasterValues;
+  let second: RasterValues | null = null;
+  if (firstWidth < count) {
+    second = await d.image.readRasters({
+      window: [0, startRow, count - firstWidth, endRow + 1],
+      samples: [0], interleave: true,
+    }) as unknown as RasterValues;
+  }
+  return { startCol, startRow, first, second, firstWidth };
+}
+
+function rasterValue(window: Awaited<ReturnType<typeof readRasterWindow>>, col: number, row: number): number {
+  const localCol = wrap(col - window.startCol, window.first.width + (window.second?.width ?? 0));
+  const localRow = row - window.startRow;
+  if (localCol < window.firstWidth) {
+    return window.first[localRow * window.first.width + localCol];
+  }
+  if (!window.second) return window.first[localRow * window.first.width + localCol];
+  const secondCol = localCol - window.firstWidth;
+  return window.second[localRow * window.second.width + secondCol];
+}
+
+function interpolateRaster(d: DemImage, window: Awaited<ReturnType<typeof readRasterWindow>>, col: number, row: number): number {
+  const c0 = Math.floor(col), r0 = Math.floor(row);
+  const c1 = c0 + 1;
+  const r1 = Math.min(d.height - 1, r0 + 1);
+  const tx = col - c0, ty = row - r0;
+  const samples = [
+    [rasterValue(window, c0, r0), (1 - tx) * (1 - ty)],
+    [rasterValue(window, c1, r0), tx * (1 - ty)],
+    [rasterValue(window, c0, r1), (1 - tx) * ty],
+    [rasterValue(window, c1, r1), tx * ty],
+  ] as const;
+  let sum = 0, weight = 0;
+  for (const [value, w] of samples) {
+    if (Number.isFinite(value) && (d.noData === null || value !== d.noData)) {
+      sum += value * w;
+      weight += w;
+    }
+  }
+  if (weight <= 0) throw new Error('The MOLA DEM has no valid elevation data at this location.');
+  return sum / weight;
+}
+
+async function sampleTile(id: string, token: number, face: number, cx: number, cy: number, res: number, chunks: number): Promise<{
+  heights: Float32Array; materials: Uint8Array;
+}> {
+  if (!dem) throw new Error('Load a global MOLA DEM before generating terrain.');
+  const d = dem;
+  const heights = new Float32Array(res * res);
+  const materials = new Uint8Array(res * res);
+  const locations: Array<{ col: number; row: number }> = [];
+  let anchorCol = 0;
+
+  for (let j = 0; j < res; j++) {
+    for (let i = 0; i < res; i++) {
+      const u = -1 + (2 * (cx + i / (res - 1))) / chunks;
+      const v = -1 + (2 * (cy + j / (res - 1))) / chunks;
+      const direction = faceDirection(face, u, v);
+      const lat = Math.asin(Math.max(-1, Math.min(1, direction.y))) * 180 / Math.PI;
+      const lon = Math.atan2(direction.z, direction.x) * 180 / Math.PI;
+      const coordinate = rasterCoordinates(d, lat, lon);
+      if (locations.length === 0) anchorCol = coordinate.col;
+      while (coordinate.col - anchorCol > d.width / 2) coordinate.col -= d.width;
+      while (coordinate.col - anchorCol < -d.width / 2) coordinate.col += d.width;
+      locations.push(coordinate);
+    }
+  }
+
+  const cols = locations.map(p => p.col);
+  const rows = locations.map(p => p.row);
+  const minCol = Math.floor(Math.min(...cols));
+  const maxCol = Math.floor(Math.max(...cols)) + 1;
+  const minRow = Math.max(0, Math.floor(Math.min(...rows)));
+  const maxRow = Math.min(d.height - 1, Math.floor(Math.max(...rows)) + 1);
+  const rasterWindow = await readRasterWindow(d, minCol, maxCol, minRow, maxRow);
+  // Drop any decoded TIFF blocks after this tile. This bounds the reader's
+  // decoded-data memory even when the entire 2 GB source is eventually visited.
+  d.image.tiles = null;
+
+  for (let j = 0; j < res; j++) {
+    if (token !== generationRevision) throw new Error('Generation stopped.');
+    for (let i = 0; i < res; i++) {
+      const index = j * res + i;
+      const point = locations[index];
+      heights[index] = interpolateRaster(d, rasterWindow, point.col, point.row);
+      // MOLA is elevation-only; it carries no mineral/material classification.
+      materials[index] = 0;
+    }
+    if (j % 4 === 0) ctx.postMessage({ type: 'progress', id, progress: j / (res - 1) });
+  }
+  return { heights, materials };
+}
+
+function makeCacheKey(face: number, cx: number, cy: number, res: number, chunks: number): string {
+  return `${DEM_CACHE_VERSION}|${sourceKey}|${chunks}|${res}|${face}|${cx}|${cy}`;
+}
+
+async function decodeCachedTile(blob: Blob, face: number, cx: number, cy: number, res: number): Promise<{
+  heights: Float32Array; materials: Uint8Array;
+} | null> {
+  const expectedBytes = HEADER_BYTES + res * res * 5;
+  if (blob.size !== expectedBytes) return null;
+  const buffer = await blob.arrayBuffer();
+  const view = new DataView(buffer);
+  if (view.getUint32(0, true) !== 0x4d415253 || view.getUint32(4, true) !== 1 ||
+      view.getUint32(8, true) !== face || view.getUint32(12, true) !== cx ||
+      view.getUint32(16, true) !== cy || view.getUint32(20, true) !== res) return null;
+  const heights = new Float32Array(res * res);
+  const heightBytes = new Uint8Array(buffer, HEADER_BYTES, res * res * 4);
+  new Uint8Array(heights.buffer).set(heightBytes);
+  const materials = new Uint8Array(buffer, HEADER_BYTES + res * res * 4, res * res).slice();
+  return { heights, materials };
+}
+
+async function generate(message: any, token: number): Promise<void> {
+  const { id, face, cx, cy, res, chunks } = message;
+  if (!dem || !sourceKey) throw new Error('No ready MOLA DEM. Use Load MOLA and wait for it to finish indexing.');
+  const cacheKey = makeCacheKey(face, cx, cy, res, chunks);
+  let cacheError = '';
+  if (!cacheReadDisabled) {
+    try {
+      const record = await getCachedTerrainTile(cacheKey);
+      if (record) {
+        const decoded = await decodeCachedTile(record.blob, face, cx, cy, res);
+        if (decoded) {
+          if (token !== generationRevision) return;
+          ctx.postMessage({
+            type: 'done', id, blob: record.blob, crc: record.crc,
+            heights: decoded.heights, materials: decoded.materials, cached: true,
+          }, [decoded.heights.buffer, decoded.materials.buffer]);
+          return;
+        }
+      }
+    } catch (error) {
+      cacheReadDisabled = true;
+      cacheWriteDisabled = true;
+      cacheError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  if (token !== generationRevision) return;
+  const { heights, materials } = await sampleTile(id, token, face, cx, cy, res, chunks);
+  if (token !== generationRevision) return;
+  const header = new Uint32Array([0x4d415253, 1, face, cx, cy, res]);
+  let crcState = crc32Init();
+  crcState = crc32Update(crcState, new Uint8Array(header.buffer));
+  crcState = crc32Update(crcState, new Uint8Array(heights.buffer));
+  crcState = crc32Update(crcState, materials);
+  const crc = crc32Digest(crcState);
+  const blob = new Blob([
+    header.buffer as ArrayBuffer,
+    heights.buffer as ArrayBuffer,
+    materials.buffer as ArrayBuffer,
+  ], { type: 'application/octet-stream' });
+  if (!cacheWriteDisabled) {
+    try {
+      await cacheTerrainTile({ key: cacheKey, blob, crc });
+    } catch (error) {
+      cacheWriteDisabled = true;
+      cacheError = error instanceof Error ? error.message : String(error);
+    }
+  }
+  if (token !== generationRevision) return;
+  ctx.postMessage({
+    type: 'done', id, blob, crc, heights, materials,
+    cached: false, cacheError,
+  }, [heights.buffer, materials.buffer]);
+}
+
+ctx.onmessage = event => {
+  const message = event.data;
+  if (message.type === 'stop') {
+    generationRevision++;
+    return;
+  }
+  if (message.type === 'set-dem-blob' || message.type === 'set-dem-url') {
+    void openDem(message);
+    return;
+  }
+  if (message.type === 'generate') {
+    const token = ++generationRevision;
+    void generate(message, token).catch(error => {
+      if (token !== generationRevision) return;
+      ctx.postMessage({
+        type: 'error', id: message.id,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    });
+  }
+};
