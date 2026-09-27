@@ -1,7 +1,7 @@
 /// <reference lib="webworker" />
 import { fromBlob, fromUrl, type GeoTIFF, type GeoTIFFImage } from 'geotiff';
 import { MARS_RADIUS_M } from './config';
-import { cacheTerrainTile, getCachedTerrainTile } from './terrain-cache';
+import { cacheTerrainTile, clearCachedTerrainTiles, getCachedTerrainTile } from './terrain-cache';
 import { crc32Init, crc32Update, crc32Digest } from './zip';
 
 const ctx = self as unknown as DedicatedWorkerGlobalScope;
@@ -383,6 +383,22 @@ ctx.onmessage = event => {
   const message = event.data;
   if (message.type === 'stop') {
     generationRevision++;
+    return;
+  }
+  if (message.type === 'clear-cache') {
+    // Reset cleanup: invalidate any in-flight tile and wipe every generated
+    // .mars file persisted in the browser cache.
+    generationRevision++;
+    cacheReadDisabled = false;
+    cacheWriteDisabled = false;
+    void clearCachedTerrainTiles().then(() => {
+      ctx.postMessage({ type: 'cache-cleared' });
+    }).catch(error => {
+      ctx.postMessage({
+        type: 'cache-clear-error',
+        message: error instanceof Error ? error.message : String(error),
+      });
+    });
     return;
   }
   if (message.type === 'set-dem-blob' || message.type === 'set-dem-url') {

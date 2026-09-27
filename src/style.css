@@ -146,3 +146,53 @@
 .demNotice{max-width:none;margin:-10px 0 16px}
 .demNotice .spin{animation:packSpin 1s linear infinite}
 .chunkEnd .cacheTag{font-family:'DM Mono';font-size:8px;letter-spacing:.8px;text-transform:uppercase;color:#70a986}
+
+/* --- generation controls card --------------------------------------------- */
+.controlCard{border:1px solid #ffffff12;background:#171516;padding:15px 18px 17px;display:flex;flex-direction:column;gap:12px}
+.controlCardTitle{font-family:'DM Mono';font-size:9px;letter-spacing:2px;color:#9a8e85}
+.controlRow{display:flex;gap:8px;flex-wrap:wrap}
+
+/* --- progress status card: run time / ETA / download ---------------------- */
+.runTimes{display:flex;align-items:center;gap:20px;margin-top:13px;font-family:'DM Mono';font-size:9px;letter-spacing:1.3px;color:#817a75;flex-wrap:wrap}
+.runTimes b{color:#d7c9bf;font-weight:500}
+.runTimes .zipBtn{margin-left:auto;display:flex;align-items:center;gap:9px;border:1px solid #ffffff18;background:#ffffff08;border-radius:3px;height:34px;padding:0 15px;font-size:11.5px;color:#eee9e2;font-family:Manrope,sans-serif;letter-spacing:0}
+.runTimes .zipBtn svg{width:15px;color:#d76b50}
+.runTimes .zipBtn:hover:not(:disabled){border-color:#ca5c4466;background:#201c1d}
+.runTimes .zipBtn:disabled{opacity:.35;cursor:not-allowed}
+
+/* --- visualization buttons above the queue -------------------------------- */
+.visRow{display:flex;align-items:center;gap:16px;padding:20px 0 14px;flex-wrap:wrap}
+.visRowTitle{font-family:'DM Mono';font-size:9px;letter-spacing:2px;color:#9a8e85}
+.visRow>div{display:flex;gap:10px;flex-wrap:wrap}
+.visRow button{border:1px solid #ffffff18;background:#ffffff08;border-radius:3px;height:42px;padding:0 16px;display:flex;align-items:center;gap:9px;font-size:12px;transition:border-color .15s,background .15s}
+.visRow button:hover{border-color:#ca5c4466;background:#201c1d}
+.visRow svg{width:17px;color:#d76b50}
+
+/* --- modal dialogs (settings, error, confirm) ------------------------------ */
+.modalOverlay{position:fixed;inset:0;z-index:60;display:grid;place-items:center;padding:24px;background:#080708d9;backdrop-filter:blur(5px)}
+.dialogOverlay{z-index:70}
+.appDialog{width:min(100%,480px);padding:34px;background:linear-gradient(145deg,#211718,#151314 70%);border:1px solid #c95c4b66;box-shadow:0 24px 90px #000b}
+.appDialog .appDialogIcon{width:44px;height:44px;border:1px solid #c95c4b66;background:#8a2f2322;display:grid;place-items:center;color:#df6c52;margin-bottom:18px}
+.appDialog .appDialogIcon svg{width:20px;height:20px}
+.appDialog h2{margin:0 0 12px;font-size:24px;letter-spacing:-.6px}
+.appDialog p{margin:0;color:#a39a94;font-size:13px;line-height:1.8}
+
+/* --- settings dialog -------------------------------------------------------- */
+.settingsOverlay{z-index:60}
+.settingsDialog{width:min(100%,1080px);max-height:calc(100vh - 48px);display:flex;flex-direction:column}
+.settingsHead{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;padding:28px 30px 0}
+.settingsHead h2{margin:10px 0 0;font-size:26px;letter-spacing:-1px}
+.settingsClose{width:40px;height:40px;flex-shrink:0;display:grid;place-items:center;background:#ffffff0b;border:1px solid #ffffff20;border-radius:3px}
+.settingsClose:hover{border-color:#ca5c4466;color:#e0805f}
+.settingsClose svg{width:17px}
+.settingsBody{overflow-y:auto;padding:6px 30px 32px;min-height:0}
+.settingsDialog .configPanel{border:0;background:none;padding:0;margin:0}
+.demSection .configHead{margin-bottom:14px}
+.demPicker{display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+.demStatus{display:flex;align-items:center;gap:10px;font-family:'DM Mono';font-size:10px;letter-spacing:1px;color:#9a8e85;line-height:1.7;min-width:0}
+.demStatus svg{width:15px;height:15px;flex-shrink:0;color:#8f8984}
+.demStatus.good svg{color:#70a986}
+.demStatus.bad{color:#df8b76}
+.demStatus.bad svg{color:#df6c52}
+.demStatus .spin{animation:packSpin 1s linear infinite}
+@media(max-width:700px){.modalOverlay{padding:12px}.appDialog{padding:24px}.settingsHead{padding:20px 18px 0}.settingsBody{padding:4px 18px 20px}.demPicker{align-items:flex-start;flex-direction:column}}
