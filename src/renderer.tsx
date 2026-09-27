@@ -1,31 +1,56 @@
 // Interactive 3D terrain renderer.
 //
 // Draws the generated .mars tiles as a seamless mesh in a local tangent frame
-// (see terrain.ts): pick a focus tile, choose how many tiles around it to show,
-// and orbit or fly over the result while the rest of the planet keeps
-// generating. Tiles stream into the scene as the worker completes them, so the
-// view doubles as a live preview of a run.
+// (see terrain.ts). Tile selection is viewport-driven: on every rebuild the
+// renderer picks the generated tiles that are actually visible from the
+// camera — inside the view frustum and within the view distance — and streams
+// their meshes in under a per-frame time budget. Whatever you look at fills
+// in, no matter how large the run is (nearest tiles first, bounded by
+// MAX_TILES); chunks outside the view are dropped instead of accumulating.
+//
+// The tangent frame re-anchors to the camera's look point as you pan or fly
+// across the planet: the flat layout stays accurate everywhere (the
+// azimuthal-equidistant projection is only good near its anchor) and local
+// coordinates stay small. Re-anchoring re-expresses the camera pose in the new
+// frame, so the view is continuous across the jump.
+//
+// Relief is drawn at true scale by default (1 m vertical per 1 m horizontal,
+// straight from the Float32 elevation grids); the VERTICAL SCALE slider
+// exaggerates it on demand.
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import * as THREE from 'three';
 import {
   Mountain, X, Eye, EyeOff, Grid3x3, Sun, Move3d, Crosshair, Camera, Layers, Info,
 } from 'lucide-react';
-import { formatMeters, fmt } from './config';
+import { formatMeters, fmt, MARS_RADIUS_M } from './config';
 import { Chunk } from './types';
-import { faceDirVec } from './region';
+import { Vec3, faceDirVec } from './region';
 import {
   Frame, LocalPoint, ShadeMode, TileIndex, TileRecord, TileRef,
   MATERIAL_LABELS, angleBetween, buildTileGeometry, frameToDirection, localFrame,
   materialHex, projectToFrame, sampleTerrain, tileAngleRad, tileCenterDir, tileKey,
 } from './terrain';
 
-// How many tiles a window may hold (a tile is ~2k triangles / ~50 KB of GPU
-// buffers) and the largest window radius the UI offers, in tiles.
-const MAX_TILES = 900;
-const MAX_RADIUS = 12;
-const SYNC_MS = 180;      // queue poll interval
-const REBUILD_MS = 220;   // minimum delay between window rebuilds
+// Hard budget of simultaneously drawn tiles (a tile is ~2k triangles / ~64 KB
+// of GPU buffers). Viewport selection is nearest-first, so this only bites
+// when more tiles than this are on screen at once (zoomed far out).
+const MAX_TILES = 2600;
+// Largest manual view distance the UI offers, in tile-widths.
+const MAX_VIEW_TILES = 48;
+const SYNC_MS = 180;        // queue poll interval
+const REBUILD_MS = 120;     // minimum delay between viewport reselections
+const BUILD_BUDGET_MS = 7;  // per-frame budget for streaming tile meshes in
+// Past this much drift between the camera's look point and the frame anchor,
+// the local frame re-anchors (keeps the projection accurate planet-wide and
+// vertex coordinates small). Re-anchoring is deferred while a drag is held.
+const REANCHOR_FLAT = 0.44;    // ~25°: the flat layout starts distorting past ~30°
+const REANCHOR_CURVED = 0.7;   // ~40°: the curved layout is exact anywhere
+// Angular radius from the frame anchor that each layout can draw without
+// visible distortion (the flat layout stretches circumferentially with
+// distance: 4.7% at 30°, 21% at 60°).
+const SEL_ANGLE_FLAT = 1.05;   // ~60°
+const SEL_ANGLE_CURVED = 1.55; // ~89°: the true sphere just dips under the horizon
 
 const DEG = Math.PI / 180;
 const ELEVATION_LEGEND =
@@ -83,13 +108,15 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
   const mountRef = useRef<HTMLDivElement>(null);
 
   const [shade, setShade] = useState<ShadeMode>('material');
-  const [exaggeration, setExaggeration] = useState(2);
-  const [radius, setRadius] = useState(4);
-  // Auto window: stay centred on the starting tile and grow outward with the
-  // generation frontier (up to MAX_TILES), so a run visibly fills in from one
-  // spot. Moving the radius slider switches to a fixed radius.
-  const [autoRadius, setAutoRadius] = useState(true);
-  const [effectiveRadius, setEffectiveRadius] = useState(0);
+  // 1 = true scale: every vertex sits at its actual elevation in metres.
+  // Higher values exaggerate relief vertically (opt-in, for readability).
+  const [exaggeration, setExaggeration] = useState(1);
+  // View distance: how far from the camera generated tiles are drawn. Auto
+  // mode follows the camera zoom (zoom out to reveal more terrain, with fog
+  // hiding the edge); the slider pins a fixed distance in tile-widths.
+  const [autoView, setAutoView] = useState(true);
+  const [viewTiles, setViewTiles] = useState(6);
+  const [effViewTiles, setEffViewTiles] = useState(6);
   const [curvature, setCurvature] = useState(false);
   const [wireframe, setWireframe] = useState(false);
   const [showGrid, setShowGrid] = useState(true);
@@ -104,6 +131,7 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
   const [focusTile, setFocusTile] = useState<TileRef | null>(focus);
   const [hud, setHud] = useState<Hud>(EMPTY_HUD);
   const [empty, setEmpty] = useState(false);
+  const [voidView, setVoidView] = useState(false);
   const [locked, setLocked] = useState(false);
 
   // --- three.js handles ------------------------------------------------------
@@ -121,26 +149,43 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
   const indexRef = useRef<TileIndex>(new Map());
   const seenRef = useRef<Map<string, Chunk>>(new Map());
   const meshesRef = useRef<Map<string, THREE.Mesh>>(new Map());
+  // The current viewport window: everything the renderer knows about the
+  // active frame and the selected tile set.
   const windowRef = useRef<{
-    center: TileRef;
+    anchorDir: Vec3;      // planet direction the local frame is centred on
     frame: Frame;
-    windowAngle: number;
-    tiles: TileRecord[];
-    span: number;
+    anchorGen: number;    // bumped on every re-anchor (invalidates meshes)
+    tileAngle: number;    // angular width of one tile at the anchor (rad)
+    viewDist: number;     // metres; tiles farther than this are not drawn
+    tiles: TileRecord[];  // the selected (visible) tiles, nearest first
     meanElevation: number;
   } | null>(null);
+  // Monotonic anchor generation: every (re-)anchor gets a fresh id, so caches
+  // and mesh keys can never collide with a previous window's.
+  const anchorSeqRef = useRef(0);
+  // Local-frame centre + bounding radius per tile, keyed by tileKey. Valid
+  // for one anchor/relief signature only (see cacheSigRef).
+  const centerCacheRef = useRef<Map<string, { x: number; y: number; z: number; r: number }>>(new Map());
+  const cacheSigRef = useRef('');
+  const buildQueueRef = useRef<TileRecord[]>([]);
+  const selectedKeysRef = useRef<Set<string>>(new Set());
+  const geoKeyRef = useRef('');
   const dirtyRef = useRef(false);
   const lastSyncRef = useRef(0);
   const lastRebuildRef = useRef(0);
+  const lastGridRef = useRef(0);
   const framedKeyRef = useRef('');
   const framedOnceRef = useRef(false);
   const framedNRef = useRef(0);
   const fpsRef = useRef(0);
+  // Snapshot of the camera pose at the last selection: the render loop
+  // compares against it to reselect when the camera moves or turns.
+  const camPoseRef = useRef<{ pos: THREE.Vector3; dir: THREE.Vector3 } | null>(null);
   // Cleared for good once the user drags, zooms or flies — until then the
-  // camera keeps fitting itself to the growing/sliding window.
+  // camera may ease itself (e.g. following generation).
   const cameraTouchedRef = useRef(false);
-  // Orbit framing the render loop eases towards while the camera is untouched.
-  const fitGoalRef = useRef<{ distance: number; targetY: number } | null>(null);
+  // Orbit target the render loop eases towards while the camera is untouched.
+  const fitGoalRef = useRef<{ target: THREE.Vector3; distance: number | null } | null>(null);
 
   const orbitRef = useRef({ theta: 0.6, phi: 1.02, distance: 1000, target: new THREE.Vector3() });
   const flyRef = useRef({ pos: new THREE.Vector3(0, 5000, 2000), yaw: 0, pitch: -0.2 });
@@ -153,12 +198,12 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
   // Everything the render loop and the rebuild routine need, mirrored from
   // React state so the three.js effect can stay mounted for the whole session.
   const paramsRef = useRef({
-    shade, exaggeration, curvature, radius, sunAz, sunEl, wireframe, showGrid,
-    autoRotate, follow, mode, flySpeedIdx, nPerFace, resolution, focusTile, relief, autoRadius,
+    shade, exaggeration, curvature, viewTiles, autoView, sunAz, sunEl, wireframe, showGrid,
+    autoRotate, follow, mode, flySpeedIdx, nPerFace, resolution, focusTile, relief,
   });
   paramsRef.current = {
-    shade, exaggeration, curvature, radius, sunAz, sunEl, wireframe, showGrid,
-    autoRotate, follow, mode, flySpeedIdx, nPerFace, resolution, focusTile, relief, autoRadius,
+    shade, exaggeration, curvature, viewTiles, autoView, sunAz, sunEl, wireframe, showGrid,
+    autoRotate, follow, mode, flySpeedIdx, nPerFace, resolution, focusTile, relief,
   };
 
   // --- window construction ---------------------------------------------------
@@ -168,100 +213,45 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
     (mesh.parent ?? groupRef.current)?.remove(mesh);
   }, []);
 
-  /**
-   * Rebuild the visible window: select the tiles around the focus, refresh
-   * their meshes (reusing buffers where possible), the tile grid overlay, the
-   * fog/clipping ranges and — when asked — the camera framing.
-   */
-  const buildWindow = useCallback((frameCamera: boolean) => {
-    const group = groupRef.current;
-    const index = indexRef.current;
-    if (!group) return;
-
+  /** Camera pose from the orbit/fly state (shared by the render loop and the
+   *  window rebuild, which needs a fresh frustum). */
+  const applyCameraPose = useCallback((camera: THREE.PerspectiveCamera) => {
     const p = paramsRef.current;
-    const N = p.nPerFace;
-    const res = p.resolution;
-
-    const clearWindow = () => {
-      for (const mesh of meshesRef.current.values()) disposeMesh(mesh);
-      meshesRef.current.clear();
-      windowRef.current = null;
-      framedKeyRef.current = '';
-      setEmpty(true);
-      if (gridRef.current) {
-        gridRef.current.geometry.setAttribute('position', new THREE.Float32BufferAttribute([], 3));
-      }
-    };
-
-    // Focus: the requested tile, else the first tile that completed.
-    let center = p.focusTile;
-    if (!center) {
-      const any = index.size ? (index.values().next().value as TileRecord) : undefined;
-      center = any ? { face: any.face, x: any.x, y: any.y } : null;
-    }
-    if (!center) {
-      clearWindow();
-      return;
-    }
-
-    const centerDir = tileCenterDir(center.face, center.x, center.y, N);
-    const frame = localFrame(centerDir);
-    const tileAngle = tileAngleRad(center.face, center.x, center.y, N);
-    const maxAngle = Math.PI * 0.49;
-
-    // Every generated tile with its distance from the centre, nearest first.
-    const all: { rec: TileRecord; d: number }[] = [];
-    for (const rec of index.values()) {
-      const c = Math.max(-1, Math.min(1,
-        rec.dir.x * centerDir.x + rec.dir.y * centerDir.y + rec.dir.z * centerDir.z));
-      all.push({ rec, d: Math.acos(c) });
-    }
-    all.sort((a, b) =>
-      a.d - b.d || a.rec.face - b.rec.face || a.rec.y - b.rec.y || a.rec.x - b.rec.x);
-
-    // Fixed radius: a disc of `radius` tile-widths. Auto: everything generated
-    // so far (nearest MAX_TILES), so the window grows with the frontier while
-    // the centre stays put.
-    let windowAngle: number;
-    if (p.autoRadius) {
-      const within = all.filter(c => c.d <= maxAngle).slice(0, MAX_TILES);
-      const far = within.length ? within[within.length - 1].d : 0;
-      windowAngle = Math.min(maxAngle, Math.max(tileAngle, far + tileAngle * 0.01));
+    if (p.mode === 'orbit') {
+      const o = orbitRef.current;
+      const sinP = Math.sin(o.phi);
+      camera.position.set(
+        o.target.x + o.distance * sinP * Math.sin(o.theta),
+        o.target.y + o.distance * Math.cos(o.phi),
+        o.target.z + o.distance * sinP * Math.cos(o.theta),
+      );
+      camera.lookAt(o.target);
     } else {
-      windowAngle = Math.min(maxAngle, Math.max(tileAngle, p.radius * tileAngle));
+      const f = flyRef.current;
+      const cp = Math.cos(f.pitch);
+      tmpA.set(Math.sin(f.yaw) * cp, Math.sin(f.pitch), -Math.cos(f.yaw) * cp);
+      camera.position.copy(f.pos);
+      camera.lookAt(tmpB.copy(f.pos).add(tmpA));
     }
-    const chosen = all.filter(c => c.d <= windowAngle).slice(0, MAX_TILES);
-    setEffectiveRadius(Math.max(1, Math.round(windowAngle / tileAngle)));
-    if (chosen.length === 0) {
-      // Nothing generated inside the window yet — keep the empty state rather
-      // than framing a camera around nothing.
-      clearWindow();
-      return;
-    }
-    setEmpty(false);
+    camera.updateMatrixWorld(true);
+  }, []);
 
-    const geoKey = `${N}|${res}|${p.exaggeration}|${p.curvature ? 1 : 0}|${p.shade}|${p.relief}` +
-      `|${center.face}-${center.x}-${center.y}`;
-    const neighbor = (f: number, x: number, y: number): Float32Array | null =>
-      index.get(tileKey(f, x, y))?.heights ?? null;
-
-    // Drop meshes that left the window.
-    const keep = new Set(chosen.map(c => tileKey(c.rec.face, c.rec.x, c.rec.y)));
-    for (const [key, mesh] of [...meshesRef.current]) {
-      if (!keep.has(key)) {
-        disposeMesh(mesh);
-        meshesRef.current.delete(key);
-      }
-    }
-
-    let span = 0;
-    let meanSum = 0;
-    const gridPoints: number[] = [];
+  /** Tile-boundary overlay for the meshes currently in the scene. */
+  const rebuildGrid = useCallback(() => {
+    const grid = gridRef.current;
+    const win = windowRef.current;
+    if (!grid || !win) return;
+    const p = paramsRef.current;
+    const res = p.resolution;
+    const N = p.nPerFace;
     const corners = [[0, 0], [res - 1, 0], [res - 1, res - 1], [0, res - 1]] as const;
-
-    // Tile boundary outline, lifted slightly so it reads over the relief.
-    const pushGrid = (rec: TileRecord, extent: number) => {
-      const lift = Math.max(20, extent * 0.004);
+    const pts: number[] = [];
+    for (const [key, mesh] of meshesRef.current) {
+      const rec = indexRef.current.get(key);
+      const st = mesh.userData.stats as { extent: number } | undefined;
+      if (!rec || !st) continue;
+      // Lifted slightly so the outline reads over the relief.
+      const lift = Math.max(20, st.extent * 0.004);
       for (let ci = 0; ci < 4; ci++) {
         const [i0, j0] = corners[ci];
         const [i1, j1] = corners[(ci + 1) % 4];
@@ -269,33 +259,58 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
           const u = -1 + (2 * (rec.x + i / (res - 1))) / N;
           const v = -1 + (2 * (rec.y + j / (res - 1))) / N;
           const h = (rec.heights[j * res + i] ?? 0) + lift / Math.max(0.001, p.exaggeration);
-          const pt = projectToFrame(faceDirVec(rec.face, u, v), h, frame, p.exaggeration, p.curvature);
-          gridPoints.push(pt.x, pt.y, pt.z);
+          const pt = projectToFrame(faceDirVec(rec.face, u, v), h, win.frame, p.exaggeration, p.curvature);
+          pts.push(pt.x, pt.y, pt.z);
         }
       }
-    };
+    }
+    grid.geometry.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
+    grid.geometry.computeBoundingSphere();
+    grid.visible = p.showGrid;
+  }, []);
 
-    for (const { rec } of chosen) {
-      const key = tileKey(rec.face, rec.x, rec.y);
-      // Skip tiles whose inputs haven't changed since their mesh was built:
-      // same window parameters, same height data and the same set of
-      // neighbours available for the edge normals. A growing window then only
-      // builds the newcomers and their immediate neighbours.
-      let nbrMask = 0;
+  /**
+   * Stream queued tile meshes into the scene, nearest first, stopping once
+   * `budgetMs` of wall time is spent (at least one tile per call). Big
+   * re-anchors and zoom-outs therefore fill in progressively over a few
+   * frames instead of freezing the tab.
+   */
+  const drainQueue = useCallback((budgetMs: number) => {
+    const queue = buildQueueRef.current;
+    const group = groupRef.current;
+    const material = materialRef.current;
+    const win = windowRef.current;
+    if (!queue.length || !group || !material || !win) return;
+    const p = paramsRef.current;
+    const N = p.nPerFace;
+    const res = p.resolution;
+    const geoKey = geoKeyRef.current;
+    const index = indexRef.current;
+    const neighbor = (f: number, x: number, y: number): Float32Array | null =>
+      index.get(tileKey(f, x, y))?.heights ?? null;
+    const nbrMaskOf = (rec: TileRecord): number => {
+      let m = 0;
       for (let dy = -1, bit = 0; dy <= 1; dy++) {
         for (let dx = -1; dx <= 1; dx++, bit++) {
-          if ((dx || dy) && index.has(tileKey(rec.face, rec.x + dx, rec.y + dy))) nbrMask |= 1 << bit;
+          if ((dx || dy) && index.has(tileKey(rec.face, rec.x + dx, rec.y + dy))) m |= 1 << bit;
         }
       }
-      const cached = meshesRef.current.get(key);
-      if (cached && cached.userData.geoKey === geoKey && cached.userData.heights === rec.heights &&
-        cached.userData.nbrMask === nbrMask && cached.userData.stats) {
-        const st = cached.userData.stats as { cx: number; cz: number; extent: number; mean: number };
-        const reach = Math.hypot(st.cx, st.cz) + st.extent;
-        if (reach > span) span = reach;
-        meanSum += st.mean;
-        pushGrid(rec, st.extent);
-        continue;
+      return m;
+    };
+
+    const t0 = performance.now();
+    let built = 0;
+    while (queue.length) {
+      if (built > 0 && performance.now() - t0 > budgetMs) break;
+      const rec = queue.shift()!;
+      const key = tileKey(rec.face, rec.x, rec.y);
+      if (!selectedKeysRef.current.has(key)) continue;
+      const nbrMask = nbrMaskOf(rec);
+      const existing = meshesRef.current.get(key);
+      if (existing && !existing.userData.stale && existing.userData.geoKey === geoKey &&
+        existing.userData.heights === rec.heights && existing.userData.nbrMask === nbrMask &&
+        existing.userData.stats) {
+        continue; // already built with these exact inputs
       }
 
       const g = buildTileGeometry({
@@ -306,7 +321,7 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
         res,
         heights: rec.heights,
         materials: rec.materials,
-        frame,
+        frame: win.frame,
         exaggeration: p.exaggeration,
         curvature: p.curvature,
         shade: p.shade,
@@ -314,22 +329,20 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
         neighbor,
       });
 
-      let mesh = meshesRef.current.get(key);
-      const existing = mesh?.geometry;
-      if (mesh && existing &&
-        existing.getAttribute('position')?.count === res * res &&
-        mesh.userData.geoKey === geoKey) {
-        // Same window parameters -> refresh the buffers in place (no realloc).
-        const pos = existing.getAttribute('position') as THREE.BufferAttribute;
-        const nrm = existing.getAttribute('normal') as THREE.BufferAttribute;
-        const col = existing.getAttribute('color') as THREE.BufferAttribute;
-        (pos.array as Float32Array).set(g.positions);
-        (nrm.array as Float32Array).set(g.normals);
-        (col.array as Float32Array).set(g.colors);
-        pos.needsUpdate = true;
-        nrm.needsUpdate = true;
-        col.needsUpdate = true;
-        existing.computeBoundingSphere();
+      let mesh = existing;
+      if (mesh && mesh.geometry.getAttribute('position')?.count === res * res &&
+        mesh.geometry.index?.count === g.indices.length) {
+        // Same vertex count -> refresh the buffers in place (no realloc).
+        const geo = mesh.geometry;
+        (geo.getAttribute('position').array as Float32Array).set(g.positions);
+        (geo.getAttribute('normal').array as Float32Array).set(g.normals);
+        (geo.getAttribute('color').array as Float32Array).set(g.colors);
+        (geo.index!.array as Uint32Array).set(g.indices);
+        geo.getAttribute('position').needsUpdate = true;
+        geo.getAttribute('normal').needsUpdate = true;
+        geo.getAttribute('color').needsUpdate = true;
+        geo.index!.needsUpdate = true;
+        geo.computeBoundingSphere();
       } else {
         if (mesh) disposeMesh(mesh);
         const geo = new THREE.BufferGeometry();
@@ -338,101 +351,312 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
         geo.setAttribute('color', new THREE.BufferAttribute(g.colors, 3));
         geo.setIndex(new THREE.BufferAttribute(g.indices, 1));
         geo.computeBoundingSphere();
-        mesh = new THREE.Mesh(geo, materialRef.current!);
-        mesh.userData.geoKey = geoKey;
+        mesh = new THREE.Mesh(geo, material);
         group.add(mesh);
         meshesRef.current.set(key, mesh);
       }
+      mesh.visible = true;
+      mesh.userData.stale = false;
+      mesh.userData.geoKey = geoKey;
       mesh.userData.heights = rec.heights;
       mesh.userData.nbrMask = nbrMask;
       mesh.userData.stats = { cx: g.center.x, cz: g.center.z, extent: g.extent, mean: g.meanElevation };
-
-      const reach = Math.hypot(g.center.x, g.center.z) + g.extent;
-      if (reach > span) span = reach;
-      meanSum += g.meanElevation;
-      pushGrid(rec, g.extent);
+      built++;
     }
-
-    const mean = chosen.length ? meanSum / chosen.length : 0;
-    windowRef.current = {
-      center,
-      frame,
-      windowAngle,
-      tiles: chosen.map(c => c.rec),
-      span: Math.max(span, 1000),
-      meanElevation: mean,
-    };
-
-    if (gridRef.current) {
-      const geo = gridRef.current.geometry;
-      geo.setAttribute('position', new THREE.Float32BufferAttribute(gridPoints, 3));
-      geo.computeBoundingSphere();
-      gridRef.current.visible = p.showGrid;
-    }
-
-    const scene = sceneRef.current;
-    const camera = cameraRef.current;
-    const winSpan = windowRef.current.span;
-    if (scene && fogRef.current && camera) {
-      const far = Math.max(2e4, Math.min(4e7, winSpan * 12));
-      fogRef.current.near = Math.max(far * 0.06, 200);
-      fogRef.current.far = far;
-      camera.near = Math.max(0.5, winSpan / 4000);
-      camera.far = far * 1.5;
-      camera.updateProjectionMatrix();
-    }
-    if (sunRef.current) sunRef.current.position.setLength(Math.max(1e4, winSpan * 4));
-
-    // Camera framing: full framing on the first build, on Recenter, whenever
-    // the tile grid changes size, and continuously while the user hasn't taken
-    // manual control (the window grows and slides as chunks stream in, so an
-    // untouched camera keeps the whole window in frame). Once they drag, zoom
-    // or fly, moving the focus (follow mode) only slides the orbit target so
-    // the user's zoom and angles survive.
-    const centerKey = `${N}|${center.face}-${center.x}-${center.y}`;
-    const moved = framedKeyRef.current !== centerKey;
-    const autoFit = !cameraTouchedRef.current;
-    // Growth of an unchanged window (same centre and grid) while the camera is
-    // untouched: ease the orbit towards the new framing in the render loop
-    // instead of snapping on every rebuild, so a filling window zooms out
-    // smoothly rather than jumping.
-    if (autoFit && !frameCamera && !moved && framedOnceRef.current && framedNRef.current === N) {
-      fitGoalRef.current = { distance: winSpan * 1.9, targetY: mean * p.exaggeration };
-      if (p.mode === 'orbit') {
-        // Not on screen: keep the fly camera's start pose in step with the window.
-        const ty = mean * p.exaggeration;
-        flyRef.current.pos.set(winSpan * 0.9, ty + winSpan * 0.35, winSpan * 1.1);
-        const d = new THREE.Vector3(0, ty, 0).sub(flyRef.current.pos).normalize();
-        flyRef.current.yaw = Math.atan2(d.x, -d.z);
-        flyRef.current.pitch = Math.asin(Math.max(-1, Math.min(1, d.y)));
+    if (built > 0) {
+      const now = performance.now();
+      if (!buildQueueRef.current.length || now - lastGridRef.current > 250) {
+        lastGridRef.current = now;
+        rebuildGrid();
       }
+    }
+  }, [disposeMesh, rebuildGrid]);
+
+  /**
+   * Rebuild the visible window. `op`:
+   *  - 'auto': reselect what the camera sees (re-anchoring the frame if the
+   *    look point has drifted far, and sliding the target when the focus
+   *    tile moved — e.g. Follow generation).
+   *  - 'frame': full camera framing on the focus tile.
+   *  - 'recenter': keep the look point, fit the orbit distance to the
+   *    terrain visible around it.
+   */
+  const buildWindow = useCallback((op: 'auto' | 'frame' | 'recenter') => {
+    const group = groupRef.current;
+    const camera = cameraRef.current;
+    if (!group || !camera) return;
+    const p = paramsRef.current;
+    const N = p.nPerFace;
+    const res = p.resolution;
+    const index = indexRef.current;
+
+    const clearAll = () => {
+      for (const mesh of meshesRef.current.values()) disposeMesh(mesh);
+      meshesRef.current.clear();
+      buildQueueRef.current = [];
+      selectedKeysRef.current = new Set();
+      windowRef.current = null;
+      camPoseRef.current = null;
+      fitGoalRef.current = null;
+      setEmpty(true);
+      setVoidView(false);
+      if (gridRef.current) {
+        gridRef.current.geometry.setAttribute('position', new THREE.Float32BufferAttribute([], 3));
+      }
+    };
+    if (index.size === 0) {
+      clearAll();
       return;
     }
-    fitGoalRef.current = null;
-    if (frameCamera || moved || autoFit) {
-      const full = frameCamera || autoFit || !framedOnceRef.current || framedNRef.current !== N;
-      framedKeyRef.current = centerKey;
+    setEmpty(false);
+
+    // Effective focus: the requested tile if it's generated, else the first
+    // tile that completed (live preview).
+    const first = index.values().next().value as TileRecord | undefined;
+    const focusRec = p.focusTile
+      ? index.get(tileKey(p.focusTile.face, p.focusTile.x, p.focusTile.y))
+      : undefined;
+    const anchorRec = focusRec ?? first;
+    const focusTile: TileRef | null = anchorRec
+      ? { face: anchorRec.face, x: anchorRec.x, y: anchorRec.y }
+      : null;
+    if (!focusTile) {
+      clearAll();
+      return;
+    }
+
+    // --- frame anchor ---------------------------------------------------------
+    const prev = windowRef.current;
+    let frame: Frame;
+    let anchorDir: Vec3;
+    let anchorGen: number;
+    if (prev) {
+      frame = prev.frame;
+      anchorDir = prev.anchorDir;
+      anchorGen = prev.anchorGen;
+    } else {
+      anchorDir = tileCenterDir(focusTile.face, focusTile.x, focusTile.y, N);
+      frame = localFrame(anchorDir);
+      anchorGen = 1;
+    }
+    const reanchorLimit = p.curvature ? REANCHOR_CURVED : REANCHOR_FLAT;
+    // Where the frame wants to be: the tile being framed on explicit jumps,
+    // else the point the camera is looking at.
+    let candDir: Vec3;
+    if (op === 'frame') {
+      candDir = tileCenterDir(focusTile.face, focusTile.x, focusTile.y, N);
+    } else {
+      const look = p.mode === 'orbit' ? orbitRef.current.target : flyRef.current.pos;
+      candDir = frameToDirection(look as unknown as LocalPoint, frame, p.curvature);
+    }
+    // Defer re-anchoring while a drag is held: the world stays put for the
+    // gesture and re-projects once the pointer is released (pointerup pokes
+    // the dirty flag).
+    let reanchored = false;
+    if (prev && !draggingRef.current && angleBetween(candDir, anchorDir) > reanchorLimit) {
+      const oldFrame = frame;
+      const nextFrame = localFrame(candDir);
+      // Re-express the camera state in the new frame so the view continues
+      // seamlessly: same look point, same height above the ground.
+      const movePoint = (pt: THREE.Vector3): THREE.Vector3 => {
+        const dir = frameToDirection(pt as unknown as LocalPoint, oldFrame, p.curvature);
+        const elev = sampleTerrain(dir, index, N, res).elevation ?? 0;
+        const base = projectToFrame(dir, elev, nextFrame, p.exaggeration, p.curvature);
+        return new THREE.Vector3(base.x, base.y + (pt.y - elev * p.exaggeration), base.z);
+      };
+      orbitRef.current.target.copy(movePoint(orbitRef.current.target));
+      flyRef.current.pos.copy(movePoint(flyRef.current.pos));
+      if (fitGoalRef.current) fitGoalRef.current.target = movePoint(fitGoalRef.current.target);
+      frame = nextFrame;
+      anchorDir = candDir;
+      anchorGen = ++anchorSeqRef.current;
+      centerCacheRef.current.clear();
+      // Existing meshes are in the old projection — hide them until each is
+      // rebuilt from the queue.
+      for (const mesh of meshesRef.current.values()) {
+        mesh.visible = false;
+        mesh.userData.stale = true;
+      }
+      reanchored = true;
+    }
+    // Tile centres depend on the anchor, the grid density and the relief
+    // parameters.
+    const sig = `${anchorGen}|${N}|${res}|${p.exaggeration}|${p.curvature ? 1 : 0}`;
+    if (cacheSigRef.current !== sig) {
+      cacheSigRef.current = sig;
+      centerCacheRef.current.clear();
+    }
+
+    // --- camera framing (before the frustum is taken) --------------------------
+    const tileAngle = tileAngleRad(focusTile.face, focusTile.x, focusTile.y, N);
+    const groundR = MARS_RADIUS_M * tileAngle; // one tile-width in metres
+    const focusLocal = () => {
+      const fdir = tileCenterDir(focusTile!.face, focusTile!.x, focusTile!.y, N);
+      const elev = sampleTerrain(fdir, index, N, res).elevation ?? 0;
+      return projectToFrame(fdir, elev, frame, p.exaggeration, p.curvature);
+    };
+    if (op === 'frame' || !framedOnceRef.current || framedNRef.current !== N) {
+      framedKeyRef.current = `${N}|${focusTile.face}-${focusTile.x}-${focusTile.y}`;
       framedOnceRef.current = true;
       framedNRef.current = N;
-      const target = new THREE.Vector3(0, mean * p.exaggeration, 0);
-      orbitRef.current.target.copy(target);
-      if (full) {
-        orbitRef.current.distance = winSpan * 1.9;
-        flyRef.current.pos.set(winSpan * 0.9, mean * p.exaggeration + winSpan * 0.35, winSpan * 1.1);
-        const d = target.clone().sub(flyRef.current.pos).normalize();
-        flyRef.current.yaw = Math.atan2(d.x, -d.z);
-        flyRef.current.pitch = Math.asin(Math.max(-1, Math.min(1, d.y)));
+      fitGoalRef.current = null;
+      const tp = focusLocal();
+      const D = Math.max(3000, groundR * 0.75 * 2.2);
+      orbitRef.current.target.set(tp.x, tp.y, tp.z);
+      orbitRef.current.distance = D;
+      flyRef.current.pos.set(tp.x + D * 0.45, tp.y + D * 0.35, tp.z + D * 0.55);
+      const d = new THREE.Vector3(tp.x, tp.y, tp.z).sub(flyRef.current.pos).normalize();
+      flyRef.current.yaw = Math.atan2(d.x, -d.z);
+      flyRef.current.pitch = Math.asin(Math.max(-1, Math.min(1, d.y)));
+    }
+
+    // --- camera pose + view distance ------------------------------------------
+    const camDist = p.mode === 'orbit'
+      ? orbitRef.current.distance
+      : Math.max(2000, flyRef.current.pos.y);
+    const viewDist = p.autoView
+      ? Math.max(45_000, camDist * 2.6 + groundR)
+      : Math.max(groundR * 1.05, p.viewTiles * groundR);
+    setEffViewTiles(Math.max(1, Math.round(viewDist / groundR)));
+    // Refresh the projection before taking the frustum, so the far plane
+    // always covers the view distance being selected against.
+    camera.near = Math.max(0.5, camDist / 3000);
+    camera.far = viewDist * 2.2 + camDist;
+    camera.updateProjectionMatrix();
+    applyCameraPose(camera);
+    scratchMat.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+    scratchFrustum.setFromProjectionMatrix(scratchMat);
+    const camPos = camera.position;
+
+    // --- selection: every generated tile visible from the camera ---------------
+    const selAngle = p.curvature ? SEL_ANGLE_CURVED : SEL_ANGLE_FLAT;
+    const margin = viewDist * 0.05;
+    const centerCache = centerCacheRef.current;
+    const chosen: { rec: TileRecord; d: number }[] = [];
+    for (const rec of index.values()) {
+      if (angleBetween(rec.dir, anchorDir) > selAngle) continue;
+      const key = tileKey(rec.face, rec.x, rec.y);
+      let c = centerCache.get(key);
+      if (!c) {
+        const lc = projectToFrame(rec.dir, 0, frame, p.exaggeration, p.curvature);
+        const ta = tileAngleRad(rec.face, rec.x, rec.y, N);
+        c = { x: lc.x, y: lc.y, z: lc.z, r: MARS_RADIUS_M * ta * 0.75 + 26_000 * p.exaggeration };
+        centerCache.set(key, c);
+      }
+      const d = Math.hypot(c.x - camPos.x, c.y - camPos.y, c.z - camPos.z) - c.r;
+      if (d > viewDist + margin) continue;
+      scratchSphere.center.set(c.x, c.y, c.z);
+      scratchSphere.radius = c.r + margin;
+      if (!scratchFrustum.intersectsSphere(scratchSphere)) continue;
+      chosen.push({ rec, d });
+    }
+    chosen.sort((a, b) =>
+      a.d - b.d || a.rec.face - b.rec.face || a.rec.y - b.rec.y || a.rec.x - b.rec.x);
+    if (chosen.length > MAX_TILES) chosen.length = MAX_TILES;
+    setVoidView(chosen.length === 0);
+
+    // --- drop meshes that left the view; queue the rest -------------------------
+    const geoKey = `${N}|${res}|${p.exaggeration}|${p.curvature ? 1 : 0}|${p.shade}|${p.relief}|${anchorGen}`;
+    geoKeyRef.current = geoKey;
+    const selected = new Set(chosen.map(c => tileKey(c.rec.face, c.rec.x, c.rec.y)));
+    selectedKeysRef.current = selected;
+    if (selected.size > 0) {
+      for (const [key, mesh] of [...meshesRef.current]) {
+        if (!selected.has(key)) {
+          disposeMesh(mesh);
+          meshesRef.current.delete(key);
+        }
       }
     }
-  }, [disposeMesh]);
+    const nbrMaskOf = (rec: TileRecord): number => {
+      let m = 0;
+      for (let dy = -1, bit = 0; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++, bit++) {
+          if ((dx || dy) && index.has(tileKey(rec.face, rec.x + dx, rec.y + dy))) m |= 1 << bit;
+        }
+      }
+      return m;
+    };
+    const queue: TileRecord[] = [];
+    for (const { rec } of chosen) {
+      const mesh = meshesRef.current.get(tileKey(rec.face, rec.x, rec.y));
+      if (mesh && !mesh.userData.stale && mesh.userData.geoKey === geoKey &&
+        mesh.userData.heights === rec.heights && mesh.userData.nbrMask === nbrMaskOf(rec) &&
+        mesh.userData.stats) {
+        continue;
+      }
+      queue.push(rec);
+    }
+    buildQueueRef.current = queue;
+
+    // --- window record, fog and camera planes -----------------------------------
+    const lookPt = p.mode === 'orbit' ? orbitRef.current.target : flyRef.current.pos;
+    const lookDir = frameToDirection(lookPt as unknown as LocalPoint, frame, p.curvature);
+    const meanElevation = sampleTerrain(lookDir, index, N, res).elevation ?? 0;
+    windowRef.current = {
+      anchorDir, frame, anchorGen, tileAngle, viewDist,
+      tiles: chosen.map(c => c.rec),
+      meanElevation,
+    };
+    {
+      // Fog bounds what's drawn: the view distance, and — in the flat layout —
+      // the angular cap that the projection can draw without distortion.
+      const fog = fogRef.current;
+      const edge = MARS_RADIUS_M * selAngle;
+      const far = Math.max(2000, Math.min(viewDist * 1.05, camDist + edge));
+      if (fog) {
+        fog.near = far * 0.55;
+        fog.far = far;
+      }
+    }
+
+    // --- follow / recenter -------------------------------------------------------
+    const effKey = `${N}|${focusTile.face}-${focusTile.x}-${focusTile.y}`;
+    if (op === 'recenter') {
+      // Keep the look point; fit the orbit distance to the visible terrain.
+      const t = orbitRef.current.target;
+      let reach = 0;
+      for (const { rec } of chosen) {
+        const c = centerCache.get(tileKey(rec.face, rec.x, rec.y));
+        if (c) reach = Math.max(reach, Math.hypot(c.x - t.x, c.z - t.z) + c.r);
+      }
+      if (reach > 0) orbitRef.current.distance = Math.max(3000, reach * 1.9);
+      fitGoalRef.current = null;
+      // The distance change moved the camera: reselect with the new pose.
+      dirtyRef.current = true;
+    } else if (framedKeyRef.current !== effKey) {
+      framedKeyRef.current = effKey;
+      // Focus moved (Follow generation, Center on nearest tile): slide the
+      // orbit target there, keeping the user's zoom and angles.
+      const tp = focusLocal();
+      fitGoalRef.current = { target: new THREE.Vector3(tp.x, tp.y, tp.z), distance: null };
+      const D = orbitRef.current.distance;
+      flyRef.current.pos.set(tp.x + D * 0.45, tp.y + D * 0.35, tp.z + D * 0.55);
+      const d = new THREE.Vector3(tp.x, tp.y, tp.z).sub(flyRef.current.pos).normalize();
+      flyRef.current.yaw = Math.atan2(d.x, -d.z);
+      flyRef.current.pitch = Math.asin(Math.max(-1, Math.min(1, d.y)));
+    }
+
+    // --- grid + first build burst -------------------------------------------------
+    rebuildGrid();
+    drainQueue(op === 'frame' || reanchored || meshesRef.current.size === 0 ? 24 : BUILD_BUDGET_MS);
+
+    // Snapshot for the camera-motion dirty check in the render loop.
+    camPoseRef.current = {
+      pos: camera.position.clone(),
+      dir: camera.getWorldDirection(scratchVec3).clone(),
+    };
+  }, [disposeMesh, applyCameraPose, rebuildGrid, drainQueue]);
 
   const buildWindowRef = useRef(buildWindow);
   buildWindowRef.current = buildWindow;
+  const drainQueueRef = useRef(drainQueue);
+  drainQueueRef.current = drainQueue;
 
-  // Rebuild on any change that alters geometry or the window contents.
+  // Reselect on any change that alters geometry or the visible set.
   useEffect(() => {
-    buildWindowRef.current(false);
-  }, [focusKey, radius, autoRadius, exaggeration, curvature, shade, relief, nPerFace, resolution]);
+    buildWindowRef.current('auto');
+  }, [focusKey, viewTiles, autoView, exaggeration, curvature, shade, relief, nPerFace, resolution]);
 
   // Grid overlay / wireframe are cheap: apply without rebuilding geometry.
   useEffect(() => {
@@ -494,9 +718,8 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
     if (newest && paramsRef.current.follow) {
       setFocusTile({ face: newest.face, x: newest.x, y: newest.y });
     }
-    // Without "Follow generation" the focus never moves on its own: the view
-    // stays on the tile it opened on (or the one picked via "Center on nearest
-    // tile"), and new chunks inside that window stream in as they complete.
+    // Without "Follow generation" the view stays where it is and newly
+    // completed chunks simply stream into it wherever they are.
     return added;
   }, [getChunks, disposeMesh]);
 
@@ -595,12 +818,15 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
     const onPointerUp = (e: PointerEvent) => {
       draggingRef.current = null;
       el.releasePointerCapture?.(e.pointerId);
+      // A drag may have carried the look point past the re-anchor threshold
+      // (deferred during the gesture): reselect now.
+      dirtyRef.current = true;
     };
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
       cameraTouchedRef.current = true;
       const o = orbitRef.current;
-      const max = Math.max(2e4, (windowRef.current?.span ?? 1e4) * 20);
+      const max = Math.max(2e6, MARS_RADIUS_M * 4);
       o.distance = Math.max(5, Math.min(max, o.distance * Math.exp(e.deltaY * 0.0012)));
     };
     const onContext = (e: Event) => e.preventDefault();
@@ -655,51 +881,34 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
       const dt = Math.min(0.1, (now - last) / 1000);
       last = now;
       const p = paramsRef.current;
+      const camera = cameraRef.current;
 
+      // 1. Queue sync: new tiles mark the viewport dirty.
       if (now - lastSyncRef.current > SYNC_MS) {
         lastSyncRef.current = now;
         if (syncTiles()) dirtyRef.current = true;
         if (!windowRef.current && indexRef.current.size > 0) dirtyRef.current = true;
       }
-      if (dirtyRef.current && now - lastRebuildRef.current > REBUILD_MS) {
-        dirtyRef.current = false;
-        lastRebuildRef.current = now;
-        buildWindowRef.current(false);
-      }
 
-      // Sun: azimuth measured from north, clockwise, in local coordinates.
-      if (sunRef.current) {
-        const az = p.sunAz * DEG;
-        const sEl = Math.sin(p.sunEl * DEG);
-        sunRef.current.position.set(
-          Math.sin(az) * Math.cos(p.sunEl * DEG),
-          sEl,
-          -Math.cos(az) * Math.cos(p.sunEl * DEG),
-        );
-        sunRef.current.position.multiplyScalar(Math.max(1e4, windowRef.current?.span ?? 1e4) * 4);
-        sunRef.current.intensity = 1.6 + 1.4 * Math.max(0, sEl);
-      }
-      if (hemiRef.current) hemiRef.current.intensity = 0.35 + 0.35 * Math.max(0.15, Math.sin(p.sunEl * DEG));
-
+      // 2. Orbit easing / auto-rotate, then fly movement — before the pose
+      //    is applied so this frame renders the eased position.
       if (p.mode === 'orbit') {
         const o = orbitRef.current;
         if (p.autoRotate) o.theta += dt * 0.08;
         const goal = fitGoalRef.current;
-        if (goal && cameraTouchedRef.current) fitGoalRef.current = null;
-        else if (goal) {
-          const k = 1 - Math.exp(-dt * 2.5);
-          o.distance += (goal.distance - o.distance) * k;
-          o.target.x += (0 - o.target.x) * k;
-          o.target.z += (0 - o.target.z) * k;
-          o.target.y += (goal.targetY - o.target.y) * k;
+        if (goal) {
+          if (cameraTouchedRef.current) {
+            fitGoalRef.current = null;
+          } else {
+            const k = 1 - Math.exp(-dt * 2.5);
+            o.target.lerp(goal.target, k);
+            if (goal.distance !== null) o.distance += (goal.distance - o.distance) * k;
+            if (o.target.distanceTo(goal.target) < 1 &&
+              (goal.distance === null || Math.abs(goal.distance - o.distance) < 1)) {
+              fitGoalRef.current = null;
+            }
+          }
         }
-        const sinP = Math.sin(o.phi);
-        camera.position.set(
-          o.target.x + o.distance * sinP * Math.sin(o.theta),
-          o.target.y + o.distance * Math.cos(o.phi),
-          o.target.z + o.distance * sinP * Math.cos(o.theta),
-        );
-        camera.lookAt(o.target);
       } else {
         const f = flyRef.current;
         const keys = keysRef.current;
@@ -721,11 +930,49 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
             .addScaledVector(UP, mv);
           if (tmpC.lengthSq() > 0) f.pos.addScaledVector(tmpC.normalize(), speed * dt);
         }
-        camera.position.copy(f.pos);
-        camera.lookAt(f.pos.x + fwd.x, f.pos.y + fwd.y, f.pos.z + fwd.z);
       }
 
-      if (rendererRef.current && sceneRef.current) {
+      // 3. Camera pose from the orbit/fly state.
+      if (camera) applyCameraPose(camera);
+
+      // 4. Viewport reselection trigger: the camera moved or turned since
+      //    the last selection.
+      const pose = camPoseRef.current;
+      const win = windowRef.current;
+      if (camera && pose && win) {
+        camera.getWorldDirection(scratchVec3);
+        if (camera.position.distanceTo(pose.pos) > Math.max(60, win.viewDist * 0.015) ||
+          scratchVec3.angleTo(pose.dir) > 0.02) {
+          dirtyRef.current = true;
+        }
+      }
+
+      // 5. Reselect (throttled).
+      if (dirtyRef.current && now - lastRebuildRef.current > REBUILD_MS) {
+        dirtyRef.current = false;
+        lastRebuildRef.current = now;
+        buildWindowRef.current('auto');
+      }
+
+      // Sun: azimuth measured from north, clockwise, in local coordinates.
+      if (sunRef.current) {
+        const az = p.sunAz * DEG;
+        const sEl = Math.sin(p.sunEl * DEG);
+        sunRef.current.position.set(
+          Math.sin(az) * Math.cos(p.sunEl * DEG),
+          sEl,
+          -Math.cos(az) * Math.cos(p.sunEl * DEG),
+        );
+        sunRef.current.position.multiplyScalar(Math.max(1e4, (windowRef.current?.viewDist ?? 1e4) * 2));
+        sunRef.current.intensity = 1.6 + 1.4 * Math.max(0, sEl);
+      }
+      if (hemiRef.current) hemiRef.current.intensity = 0.35 + 0.35 * Math.max(0.15, Math.sin(p.sunEl * DEG));
+
+      // 6. Stream pending tile meshes in (time-budgeted).
+      drainQueueRef.current(BUILD_BUDGET_MS);
+
+      // 7. Render.
+      if (rendererRef.current && sceneRef.current && camera) {
         rendererRef.current.render(sceneRef.current, camera);
       }
 
@@ -737,15 +984,15 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
       }
       if (now - hudClock > 180) {
         hudClock = now;
-        const win = windowRef.current;
+        const win2 = windowRef.current;
         let elevation: number | null = null;
         let material: number | null = null;
         let lat = 0, lon = 0, agl = 0, tile: string | null = null;
-        if (win) {
+        if (win2 && camera) {
           // Orbit: report the point being looked at (the camera can hover far
           // outside the generated window). Fly: the ground under the camera.
           const probe = p.mode === 'orbit' ? orbitRef.current.target : camera.position;
-          const dir = frameToDirection(probe as unknown as LocalPoint, win.frame, p.curvature);
+          const dir = frameToDirection(probe as unknown as LocalPoint, win2.frame, p.curvature);
           const s = sampleTerrain(dir, indexRef.current, p.nPerFace, p.resolution);
           lat = s.lat;
           lon = s.lon;
@@ -754,17 +1001,18 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
           tile = s.tile ? `F${s.tile.face}-${s.tile.x}-${s.tile.y}` : null;
           if (elevation !== null) agl = camera.position.y - elevation * p.exaggeration;
         }
+        const tiles = win2?.tiles.length ?? 0;
         setHud({
           fps: fpsRef.current,
-          tiles: meshesRef.current.size,
-          triangles: meshesRef.current.size * (p.resolution - 1) * (p.resolution - 1) * 2,
-          span: win?.span ?? 0,
+          tiles,
+          triangles: tiles * (p.resolution - 1) * (p.resolution - 1) * 2,
+          span: win2?.viewDist ?? 0,
           lat, lon, elevation, agl, material, tile,
         });
       }
     };
     raf = requestAnimationFrame(loop);
-    buildWindowRef.current(true);
+    buildWindowRef.current('frame');
 
     return () => {
       cancelAnimationFrame(raf);
@@ -780,6 +1028,7 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
       if (document.pointerLockElement === el) document.exitPointerLock?.();
       for (const mesh of meshesRef.current.values()) disposeMesh(mesh);
       meshesRef.current.clear();
+      buildQueueRef.current = [];
       windowRef.current = null;
       gridGeo.dispose();
       gridMat.dispose();
@@ -795,8 +1044,9 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
 
   // --- actions ---------------------------------------------------------------
 
+  // Fit the orbit distance to the terrain visible around the look point.
   const recenter = useCallback(() => {
-    buildWindowRef.current(true);
+    buildWindowRef.current('recenter');
   }, []);
 
   const focusOnNearest = useCallback(() => {
@@ -804,7 +1054,7 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
     if (index.size === 0) return;
     const win = windowRef.current;
     const camera = cameraRef.current;
-    const refocus = () => window.setTimeout(() => buildWindowRef.current(true), 0);
+    const refocus = () => window.setTimeout(() => buildWindowRef.current('frame'), 0);
     if (!win || !camera) {
       const any = index.values().next().value as TileRecord | undefined;
       if (any) {
@@ -858,7 +1108,7 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
           </div>
         </div>
         <div className="viewerHeadMeta">
-          <span><b>{fmt(hud.tiles)}</b> tiles</span>
+          <span><b>{fmt(hud.tiles)}</b> tiles in view</span>
           <span><b>{fmt(hud.triangles)}</b> tris</span>
           <span>focus <b>{focusLabel}</b></span>
           <span>{nPerFace} × {nPerFace} grid · {resolution}² verts/tile</span>
@@ -905,7 +1155,8 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
                   </label>
                 </>
               )}
-              <button className="panelBtn" onClick={recenter}><Crosshair /> Recenter view</button>
+              <button className="panelBtn" onClick={recenter}
+                title="Fit the orbit distance to the terrain visible around the view centre"><Crosshair /> Recenter view</button>
             </section>
 
             <section>
@@ -938,9 +1189,9 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
 
             <section>
               <h3><Mountain /> Relief</h3>
-              <label className="sliderRow">
+              <label className="sliderRow" title="1× draws every chunk at its true elevation — 1 metre up is 1 metre across, straight from the MOLA-scale height grid. Higher values exaggerate relief vertically for readability.">
                 <span>VERTICAL SCALE</span>
-                <b>{exaggeration.toFixed(1)}×</b>
+                <b>{exaggeration.toFixed(1)}×{exaggeration === 1 ? ' · true' : ''}</b>
                 <input type="range" min={1} max={8} step={0.5} value={exaggeration}
                   onChange={e => setExaggeration(Number(e.target.value))} />
               </label>
@@ -953,19 +1204,23 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
             <section>
               <h3><Grid3x3 /> Visible tiles</h3>
               <label className="sliderRow">
-                <span>WINDOW RADIUS</span>
-                <b>{autoRadius ? `auto · ${effectiveRadius}` : radius} tile{(autoRadius ? effectiveRadius : radius) === 1 ? '' : 's'}</b>
-                <input type="range" min={1} max={MAX_RADIUS} step={1}
-                  value={autoRadius ? Math.min(MAX_RADIUS, effectiveRadius) : radius}
-                  onChange={e => { setAutoRadius(false); setRadius(Number(e.target.value)); }} />
+                <span>VIEW DISTANCE</span>
+                <b>{autoView ? `auto · ~${effViewTiles}` : viewTiles} tile{(autoView ? effViewTiles : viewTiles) === 1 ? '' : 's'}</b>
+                <input type="range" min={2} max={MAX_VIEW_TILES} step={1}
+                  value={autoView ? Math.max(2, Math.min(MAX_VIEW_TILES, effViewTiles)) : viewTiles}
+                  onChange={e => { setAutoView(false); setViewTiles(Number(e.target.value)); }} />
               </label>
-              <label className="checkRow" title="Stay centred on the starting tile and grow the window outward as chunks complete (up to the tile budget)">
-                <input type="checkbox" checked={autoRadius} onChange={e => {
-                  if (!e.target.checked) setRadius(Math.max(1, Math.min(MAX_RADIUS, effectiveRadius)));
-                  setAutoRadius(e.target.checked);
+              <label className="checkRow" title="The view distance follows the camera: zoom out to reveal more generated terrain, zoom in for local detail. Fog hides the edge of what's drawn.">
+                <input type="checkbox" checked={autoView} onChange={e => {
+                  if (!e.target.checked) setViewTiles(Math.max(2, Math.min(MAX_VIEW_TILES, effViewTiles)));
+                  setAutoView(e.target.checked);
                 }} />
-                <span>Grow with generation</span>
+                <span>Auto view distance</span>
               </label>
+              <p className="hint">
+                Every generated chunk inside the camera's view is drawn — pan or fly anywhere and
+                the terrain streams in around you, bounded by the view distance{autoView ? '' : ' set above'}.
+              </p>
               <label className="checkRow">
                 <input type="checkbox" checked={showGrid} onChange={e => setShowGrid(e.target.checked)} />
                 <span>Tile grid</span>
@@ -1021,6 +1276,12 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
               </p>
             </div>
           )}
+          {voidView && !empty && (
+            <div className="viewerVoid">
+              <Info />
+              <span>No generated chunks in this direction — zoom out to widen the view, or use “Center on nearest tile”.</span>
+            </div>
+          )}
 
           <div className="viewerHud">
             <div className="hudRow">
@@ -1040,7 +1301,7 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
             </div>
             <div className="hudRow dim">
               <span>FPS</span><b>{hud.fps}</b>
-              <span>SPAN</span><b>{formatMeters(hud.span * 2)}</b>
+              <span>VIEW</span><b>{formatMeters(hud.span * 2)}</b>
             </div>
           </div>
 
@@ -1059,3 +1320,7 @@ const UP = new THREE.Vector3(0, 1, 0);
 const tmpA = new THREE.Vector3();
 const tmpB = new THREE.Vector3();
 const tmpC = new THREE.Vector3();
+const scratchVec3 = new THREE.Vector3();
+const scratchMat = new THREE.Matrix4();
+const scratchFrustum = new THREE.Frustum();
+const scratchSphere = new THREE.Sphere();
