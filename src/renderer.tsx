@@ -130,10 +130,6 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
   const framedOnceRef = useRef(false);
   const framedNRef = useRef(0);
   const fpsRef = useRef(0);
-  // Live preview (opened without pinning a tile): keep up with the generation
-  // frontier automatically so completed chunks keep streaming into the scene
-  // instead of stopping once the window around the focus is full.
-  const autoFollowRef = useRef(focus == null);
   // Cleared for good once the user drags, zooms or flies — until then the
   // camera keeps fitting itself to the growing/sliding window.
   const cameraTouchedRef = useRef(false);
@@ -391,7 +387,6 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
     let complete = 0;
     let idsMatch = true;
     let newest: TileRecord | null = null;
-    const newcomers: TileRecord[] = [];
 
     for (const c of chunks) {
       if (c.status !== 'complete' || !c.heights) continue;
@@ -413,7 +408,6 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
       index.set(tileKey(c.face, c.x, c.y), rec);
       added = true;
       newest = rec;
-      newcomers.push(rec);
     }
 
     // Removals (reset, re-generate) show up as a count mismatch.
@@ -434,25 +428,10 @@ export function TerrainViewer({ getChunks, nPerFace, resolution, focus, onClose 
 
     if (newest && paramsRef.current.follow) {
       setFocusTile({ face: newest.face, x: newest.x, y: newest.y });
-    } else if (newcomers.length > 0 && autoFollowRef.current) {
-      // Live preview: when the generation frontier leaves the visible window,
-      // slide to the nearest new tile outside it so completed chunks keep
-      // streaming into the scene instead of stopping at the window edge.
-      // Nearest-outside (not newest) keeps the slide gentle when a batch of
-      // completions lands at once.
-      const win = windowRef.current;
-      if (win) {
-        const p = paramsRef.current;
-        const centerDir = tileCenterDir(win.center.face, win.center.x, win.center.y, p.nPerFace);
-        let best: TileRecord | null = null;
-        let bestD = Infinity;
-        for (const rec of newcomers) {
-          const d = angleBetween(rec.dir, centerDir);
-          if (d > win.windowAngle && d < bestD) { bestD = d; best = rec; }
-        }
-        if (best) setFocusTile({ face: best.face, x: best.x, y: best.y });
-      }
     }
+    // Without "Follow generation" the focus never moves on its own: the view
+    // stays on the tile it opened on (or the one picked via "Center on nearest
+    // tile"), and new chunks inside that window stream in as they complete.
     return added;
   }, [getChunks, disposeMesh]);
 

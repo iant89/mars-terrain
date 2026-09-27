@@ -13,13 +13,13 @@ Generated tiles never need an output directory: when a run finishes, the complet
 
 ## 3D renderer
 
-Click **3D view** after a tile completes, or use the eye icon beside an individual tile in **Complete**, to open the local terrain renderer. Completed height and material grids stream into the scene while generation continues. The renderer shows a bounded window around a selected tile so browser memory stays predictable — and in the live preview (the **3D view** button) the window keeps up with the generation frontier on its own, so new chunks keep appearing for the whole run instead of stopping once the first window fills. The eye icon pins one tile's neighbourhood for inspection. The renderer supports:
+Click **3D view** after a tile completes, or use the eye icon beside an individual tile in **Complete**, to open the local terrain renderer. Completed height and material grids stream into the scene while generation continues. The renderer shows a bounded window around a selected tile so browser memory stays predictable — the **3D view** button centres it on the first completed tile, and the eye icon on a specific tile. The view stays where it is while chunks inside the window stream in; it only moves when you enable **Follow generation** or use **Center on nearest tile**. The renderer supports:
 
 - orbit, pan, zoom, and a pointer-lock **Fly** camera with WASD/Q/E controls;
 - material, elevation, and slope shading, with adjustable vertical exaggeration;
 - optional planet curvature, tile-grid and wireframe overlays, and configurable sun azimuth/elevation;
 - live latitude/longitude, elevation, material, tile, FPS, triangle, and span HUD data;
-- **Follow generation** to keep the newest completed tile centred (strict following, on top of the live preview's automatic window sliding) and **Save PNG** for a screenshot.
+- **Follow generation** to keep the newest completed tile centred and **Save PNG** for a screenshot.
 
 The renderer uses the same cube-sphere mapping and generated Float32 elevation grids as the `.mars` exporter. It builds shared-edge meshes in a local tangent frame, so a large planet-wide coordinate system is not needed to inspect a local play area.
 
