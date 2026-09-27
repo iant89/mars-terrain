@@ -57,3 +57,15 @@ export async function cacheTerrainTile(tile: CachedTerrainTile): Promise<void> {
     transaction.onabort = () => reject(transaction.error ?? new Error('Terrain cache write was aborted.'));
   });
 }
+
+/** Deletes every generated terrain tile saved in the browser cache. */
+export async function clearCachedTerrainTiles(): Promise<void> {
+  const db = await openDatabase();
+  await new Promise<void>((resolve, reject) => {
+    const transaction = db.transaction(STORE, 'readwrite');
+    transaction.objectStore(STORE).clear();
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error ?? new Error('Unable to clear the terrain cache.'));
+    transaction.onabort = () => reject(transaction.error ?? new Error('Terrain cache clear was aborted.'));
+  });
+}

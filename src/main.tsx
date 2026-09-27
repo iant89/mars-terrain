@@ -40,6 +40,17 @@ function numFrom(v: string, lo: number, hi: number, int = false): number {
   return int ? Math.round(c) : c;
 }
 
+/** Elapsed/remaining time formatting: m:ss, or h:mm:ss past one hour. */
+function formatDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return '0:00';
+  const total = Math.floor(ms / 1000);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const two = (n: number) => String(n).padStart(2, '0');
+  return h > 0 ? `${h}:${two(m)}:${two(s)}` : `${m}:${two(s)}`;
+}
+
 function makeInitialChunks(N: number, region: RegionSpec | null): Chunk[] {
   if (!Number.isFinite(N) || N <= 0) return [];
   if (region) {
@@ -653,6 +664,19 @@ function App() {
   }, []);
   const closeViewer = useCallback(() => setViewer(null), []);
   const [configOpen, setConfigOpen] = useState(false);
+  // Error / confirm dialog models. `errorDialog` holds the message to show in
+  // the error modal; `confirmReset` opens the reset confirmation modal.
+  const [errorDialog, setErrorDialog] = useState('');
+  const [confirmReset, setConfirmReset] = useState(false);
+  // "Use MOLA DEM" setting (Settings dialog). When enabled, the bundled global
+  // MOLA mosaic is opened automatically and a custom DEM file can be selected;
+  // terrain generation requires an enabled, ready DEM source.
+  const [useMolaDem, setUseMolaDem] = useState(true);
+  // Run clock: accumulated wall time while the queue actually generates plus
+  // the open segment since the current start/resume. Pausing/stopping closes
+  // the segment; reset zeroes it. Powers run-time + ETA under the progress bar.
+  const [clock, setClock] = useState<{ acc: number; since: number | null }>({ acc: 0, since: null });
+  const [, setClockTick] = useState(0);
   const [dem, setDem] = useState<string>('');
   const [demReady, setDemReady] = useState(false);
   const [demLoading, setDemLoading] = useState(false);
@@ -662,6 +686,7 @@ function App() {
   const demSourceRef = useRef<{ sourceId: number; name: string; autoLoad: boolean } | null>(null);
   const pendingDemMessageRef = useRef<any>(null);
   const demSourceIdRef = useRef(0);
+  const userDemRef = useRef(false); // true once the user picks their own DEM file
   const worker = useRef<Worker | null>(null);
   const busy = useRef(false);
   const packingRef = useRef(false);
@@ -677,6 +702,17 @@ function App() {
   const total = chunks.reduce((a, c) => a + c.size, 0);
   const pct = chunks.length ? Math.round(done / chunks.length * 100) : 0;
 
+  // Run time (excludes paused/stopped stretches) and a straight-line ETA from
+  // the average chunk completion rate of the current session.
+  const elapsedMs = clock.acc + (clock.since !== null ? Math.max(0, Date.now() - clock.since) : 0);
+  const remainingChunks = chunks.length - done;
+  const etaMs = running && !paused && done > 0 && remainingChunks > 0
+    ? (elapsedMs / done) * remainingChunks
+    : null;
+  const etaLabel = running && !paused
+    ? (etaMs !== null ? formatDuration(etaMs) : '—')
+    : paused ? 'paused' : '—';
+
   const reset = useCallback(() => {
     // Clears the run state and bumps the nonce so the queue-build effect
     // re-runs with the currently selected preset/region.
@@ -686,6 +722,36 @@ function App() {
     setPack({ status: 'idle', message: '' });
     setResetNonce(x => x + 1);
   }, []);
+
+  // Opens the run-clock segment (Start / Resume).
+  const openClock = useCallback(() => {
+    setClock(c => (c.since === null ? { ...c, since: Date.now() } : c));
+  }, []);
+
+  // Closes the run-clock segment (Pause / Stop / run completed).
+  const closeClock = useCallback(() => {
+    setClock(c => (c.since === null ? c : { acc: c.acc + (Date.now() - c.since), since: null }));
+  }, []);
+
+  // Confirmed reset (Reset button): stops the run and cleans up every
+  // generated file — the in-memory chunk blobs are dropped by rebuilding the
+  // queue, and the worker wipes the terrain tiles persisted in the browser
+  // cache (IndexedDB).
+  const doReset = useCallback(() => {
+    setConfirmReset(false);
+    closeClock();
+    setRunning(false);
+    setPaused(false);
+    setClock({ acc: 0, since: null });
+    sessionRef.current = false;
+    busy.current = false;
+    packingRef.current = false;
+    setPack({ status: 'idle', message: '' });
+    setCacheWarning('');
+    worker.current?.postMessage({ type: 'stop' });
+    worker.current?.postMessage({ type: 'clear-cache' });
+    setResetNonce(x => x + 1);
+  }, [closeClock]);
 
   function sendDemSource(message: any) {
     const sourceId = ++demSourceIdRef.current;
@@ -713,6 +779,7 @@ function App() {
   const [demError, setDemError] = useState('');
 
   function chooseDem(file: File) {
+    userDemRef.current = true; // never let the bundled auto-load override a user-selected source
     sendDemSource({
       type: 'set-dem-blob', kind: 'blob', blob: file,
       name: file.name, size: file.size, modified: file.lastModified,
@@ -741,6 +808,12 @@ function App() {
         const source = demSourceRef.current;
         setDemError(source?.autoLoad ? '' : message);
         setDem(source?.autoLoad ? '' : `MOLA unavailable · ${message}`);
+      }
+      if (d.type === 'cache-cleared') {
+        setCacheWarning('');
+      }
+      if (d.type === 'cache-clear-error') {
+        setCacheWarning(`Generated terrain could not be removed from the browser cache: ${d.message}`);
       }
       if (d.type === 'progress') {
         updateChunks(cs => cs.map(c => c.id === d.id ? { ...c, progress: d.progress } : c));
@@ -772,16 +845,22 @@ function App() {
   }, [updateChunks]);
 
   useEffect(() => {
-    // fromUrl + Range requests keeps the optional bundled 2 GB MOLA file as a
-    // byte-range source rather than fetching it into one giant browser Blob.
+    // Optional bundled 2 GB MOLA mosaic, opened by byte range (fromUrl + Range
+    // requests) rather than fetched into one giant browser Blob. Only attempted
+    // while "Use MOLA DEM" is enabled and no source is already live — it never
+    // overrides a DEM the user selected themselves.
+    if (!useMolaDem) return;
+    if (userDemRef.current) return;
+    if (demReady || demLoading) return;
     const url = new URL('./Mars_MGS_MOLA_DEM_mosaic_global_463m.tif', window.location.href).toString();
     sendDemSource({ type: 'set-dem-url', kind: 'url', url, name: 'MOLA global 463 m', autoLoad: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [useMolaDem]);
 
   function stop() {
     setRunning(false);
     setPaused(false);
+    closeClock();
     worker.current?.postMessage({ type: 'stop' });
     busy.current = false;
     updateChunks(cs => cs.map(c => c.status === 'generating'
@@ -790,13 +869,14 @@ function App() {
   }
 
   function retry(id: string) {
-    if (!demReady) {
-      setDemError('Load a global MOLA DEM before generating terrain.');
+    if (!useMolaDem || !demReady) {
+      setErrorDialog('Please select the MOLA DEM before attempting to generate terrain.');
       return;
     }
     sessionRef.current = true;
     updateChunks(cs => cs.map(c => c.id === id ? { ...c, status: 'pending', progress: 0, error: undefined } : c));
     setRunning(true);
+    openClock();
   }
 
   function dl(c: Chunk) {
@@ -873,7 +953,10 @@ function App() {
     if (!runningRef.current || pausedRef.current || busy.current) return;
     const next = cs.find(c => c.status === 'pending' || c.status === 'error');
     if (!next) {
-      if (runningRef.current) setRunning(false);
+      if (runningRef.current) {
+        setRunning(false);
+        closeClock();
+      }
       // A generation run finished cleanly — package and download automatically.
       if (sessionRef.current && cs.length > 0 && cs.every(c => c.status === 'complete')) {
         sessionRef.current = false;
@@ -892,7 +975,7 @@ function App() {
       res: cfgRef.current.resolution,
       chunks: cfgRef.current.nPerFace,
     });
-  }, [updateChunks, exportZip]);
+  }, [updateChunks, exportZip, closeClock]);
   pumpRef.current = pump;
 
   // Wake the pump on start/pause/stop/resume transitions only.
@@ -900,6 +983,27 @@ function App() {
     pumpRef.current();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [running, paused]);
+
+  // Tick once per second while a run is active so the run-time/ETA readout
+  // under the progress bar stays live between chunk completions.
+  useEffect(() => {
+    if (!running || paused) return;
+    const t = window.setInterval(() => setClockTick(x => x + 1), 1000);
+    return () => window.clearInterval(t);
+  }, [running, paused]);
+
+  // Escape closes the settings modal and the blocking dialogs.
+  useEffect(() => {
+    if (!configOpen && !errorDialog && !confirmReset) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      if (errorDialog) setErrorDialog('');
+      else if (confirmReset) setConfirmReset(false);
+      else if (configOpen) setConfigOpen(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [configOpen, errorDialog, confirmReset]);
 
   // Actively generating chunks first in the Queue view so they stay visible
   // under the render cap below.
@@ -938,26 +1042,30 @@ function App() {
           </div>
         </div>
         <div className="headActions">
-          <button className="folder" onClick={() => demInput.current?.click()}
-            title={demReady ? dem : 'Load a global MOLA elevation GeoTIFF'} disabled={demLoading || running}>
-            <FileImage /><span>{demReady ? 'MOLA ready' : demLoading ? 'Loading DEM…' : 'Load MOLA'}</span>
-          </button>
-          <button className="folder" onClick={() => setConfigOpen(o => !o)} title="Generation settings">
+          <button className="folder" onClick={() => setConfigOpen(true)} title="Generation settings">
             <Settings2 /><span>Settings</span>
           </button>
-          <button
-            className="folder"
-            onClick={() => openViewer()}
-            title={done ? 'Open the 3D terrain renderer' : 'Generate chunks first — the renderer shows completed tiles'}
-          >
-            <Mountain /><span>3D view</span>
-          </button>
-          <button className="globe" onClick={() => setGlobe(true)} aria-label="Open globe"><Globe2 /></button>
         </div>
       </header>
 
       {configOpen && (
-        <section className="configPanel">
+        <div className="modalOverlay settingsOverlay" onClick={() => setConfigOpen(false)}>
+          <section
+            className="appDialog settingsDialog"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Generation settings"
+            onClick={e => e.stopPropagation()}
+          >
+            <div className="settingsHead">
+              <div>
+                <span className="eyebrow"><i /> SETTINGS</span>
+                <h2>Generation settings</h2>
+              </div>
+              <button className="settingsClose" onClick={() => setConfigOpen(false)} title="Close settings"><X /></button>
+            </div>
+            <div className="settingsBody">
+      <section className="configPanel">
           <div className="configHead">
             <div>
               <span className="eyebrow"><i /> GENERATION PRESET</span>
@@ -1047,7 +1155,50 @@ function App() {
               </div>
             )}
           </div>
+
+          <div className="regionSection demSection">
+            <div className="configHead">
+              <div>
+                <span className="eyebrow"><i /> ELEVATION SOURCE</span>
+                <h2>MOLA DEM</h2>
+                <p>Terrain generation samples real elevations from a global MOLA DEM GeoTIFF. With “Use MOLA DEM” enabled, the bundled 463 m global mosaic is opened automatically by byte range — or select your own MOLA DEM file below. The file is read in small raster windows, never loaded into memory all at once.</p>
+              </div>
+              <button
+                className={`regionToggle ${useMolaDem ? 'on' : ''}`}
+                onClick={() => setUseMolaDem(o => !o)}
+                title={useMolaDem
+                  ? 'Terrain generation is enabled and uses a MOLA DEM elevation source'
+                  : 'Terrain generation is disabled while no MOLA DEM is used'}
+              >
+                {useMolaDem ? <CheckCircle2 /> : <X />}
+                <span>{useMolaDem ? 'Use MOLA DEM ON' : 'Use MOLA DEM OFF'}</span>
+              </button>
+            </div>
+            {useMolaDem && (
+              <div className="demPicker">
+                <button className="folder" onClick={() => demInput.current?.click()}
+                  title="Choose a global MOLA elevation GeoTIFF" disabled={demLoading}>
+                  <FileImage /><span>Select MOLA DEM File</span>
+                </button>
+                <div className={`demStatus ${demError ? 'bad' : demReady ? 'good' : ''}`}>
+                  {demLoading ? <RefreshCw className="spin" /> :
+                    demReady ? <CheckCircle2 /> :
+                    demError ? <AlertTriangle /> : <Database />}
+                  <span>{demLoading
+                    ? (dem || 'Indexing MOLA raster windows…')
+                    : demReady
+                      ? dem
+                      : demError
+                        ? demError
+                        : 'No DEM loaded yet — the bundled MOLA mosaic is opened automatically, or select your own file.'}</span>
+                </div>
+              </div>
+            )}
+          </div>
         </section>
+            </div>
+          </section>
+        </div>
       )}
 
       <section className="hero">
@@ -1070,50 +1221,72 @@ function App() {
         <div className="progress">
           <div><span>TOTAL PROGRESS</span><b>{pct}%</b></div>
           <div className="bar"><i style={{ width: `${pct}%` }} /></div>
+          <div className="runTimes">
+            <span>RUN TIME <b>{formatDuration(elapsedMs)}</b></span>
+            <span>ETA <b>{etaLabel}</b></span>
+            {done > 0 && (
+              <button
+                className="zipBtn"
+                onClick={() => void exportZip()}
+                disabled={pack.status === 'packing'}
+                title="Package completed chunks into zip file(s) and download them"
+              >
+                <Download /> {pack.status === 'packing' ? 'Packaging…' : 'Download ZIP'}
+              </button>
+            )}
+          </div>
         </div>
       </section>
 
       <section className="controls">
-        <div>
-          <button
-            className="primary"
-            onClick={() => {
-              if (!demReady) {
-                setDemError('Load a global MOLA DEM before generating terrain.');
-                return;
-              }
-              sessionRef.current = true;
-              setRunning(true);
-              setPaused(false);
-              try {
-                if (navigator.storage?.persist) {
-                  void navigator.storage.persist().then(persistent => {
-                    if (!persistent) setCacheWarning('Browser storage is not persistent; cached tiles can be evicted if storage is cleared or under pressure.');
-                  }).catch(() => {});
+        <div className="controlCard">
+          <span className="controlCardTitle">GENERATION CONTROLS</span>
+          <div className="controlRow">
+            <button
+              className="primary"
+              onClick={() => {
+                if (!useMolaDem || !demReady) {
+                  setErrorDialog('Please select the MOLA DEM before attempting to generate terrain.');
+                  return;
                 }
-              } catch { /* cache remains best-effort */ }
-            }}
-            disabled={(running && !paused) || !runnable}
-            title={!demReady
-              ? 'Load a global MOLA DEM before generating terrain'
-              : !runnable
-                ? 'This preset is too large to run in-browser — enable region export or pick a smaller preset'
-                : ''}
-          >
-            <Play /> {done ? 'Resume generation' : 'Begin generation'}
-          </button>
-          <button onClick={() => setPaused(!paused)} disabled={!running}><Pause /> {paused ? 'Paused' : 'Pause'}</button>
-          <button onClick={stop} disabled={!running}><Square /> Stop</button>
-          {runnable && (
-            <button onClick={() => reset()} title="Reset queue"><RefreshCw /> Reset</button>
-          )}
-          <button
-            onClick={() => void exportZip()}
-            disabled={done === 0 || pack.status === 'packing'}
-            title={done === 0 ? 'Generate chunks first' : 'Package completed chunks into zip file(s) and download them'}
-          >
-            <Download /> {pack.status === 'packing' ? 'Packaging…' : 'Download ZIP'}
-          </button>
+                sessionRef.current = true;
+                setRunning(true);
+                setPaused(false);
+                openClock();
+                try {
+                  if (navigator.storage?.persist) {
+                    void navigator.storage.persist().then(persistent => {
+                      if (!persistent) setCacheWarning('Browser storage is not persistent; cached tiles can be evicted if storage is cleared or under pressure.');
+                    }).catch(() => {});
+                  }
+                } catch { /* cache remains best-effort */ }
+              }}
+              disabled={(running && !paused) || !runnable}
+              title={!useMolaDem || !demReady
+                ? 'Select a MOLA DEM in Settings before generating terrain'
+                : !runnable
+                  ? 'This preset is too large to run in-browser — enable region export or pick a smaller preset'
+                  : ''}
+            >
+              <Play /> {done ? 'Resume generation' : 'Start'}
+            </button>
+            <button
+              onClick={() => {
+                if (!paused) {
+                  closeClock();
+                  setPaused(true);
+                } else {
+                  openClock();
+                  setPaused(false);
+                }
+              }}
+              disabled={!running}
+            ><Pause /> {paused ? 'Paused' : 'Pause'}</button>
+            <button onClick={stop} disabled={!running}><Square /> Stop</button>
+            {runnable && (
+              <button onClick={() => setConfirmReset(true)} title="Reset queue"><RefreshCw /> Reset</button>
+            )}
+          </div>
         </div>
         <span>
           {cfg.resolution} × {cfg.resolution} vertices per chunk ·
@@ -1125,7 +1298,7 @@ function App() {
 
       {!demReady && !demLoading && !demError && (
         <div className="configWarn info demNotice"><Database />
-          <span>Load the global MOLA GeoTIFF to enable terrain generation. The multi-gigabyte file is read by small raster windows, not loaded into memory all at once.</span>
+          <span>Enable “Use MOLA DEM” in Settings and select a global MOLA GeoTIFF to enable terrain generation. The multi-gigabyte file is read by small raster windows, not loaded into memory all at once.</span>
         </div>
       )}
       {demLoading && (
@@ -1141,6 +1314,20 @@ function App() {
           {pack.status === 'packing' ? <RefreshCw className="spin" /> : <CheckCircle2 />}
           <span>{pack.message}</span>
         </div>
+      )}
+
+      {(running || done > 0) && (
+        <section className="visRow">
+          <span className="visRowTitle">VISUALIZATION</span>
+          <div>
+            <button onClick={() => openViewer()} title="Open the 3D terrain renderer">
+              <Mountain /><span>Terrain Renderer</span>
+            </button>
+            <button onClick={() => setGlobe(true)} title="Open the 3D generation globe">
+              <Globe2 /><span>3D Globe</span>
+            </button>
+          </div>
+        </section>
       )}
 
       <section className="queue">
@@ -1211,6 +1398,48 @@ function App() {
       </footer>
 
       {globe && <Globe chunks={chunks} nPerFace={queueNRef.current} onClose={() => setGlobe(false)} />}
+
+      {errorDialog && (
+        <div className="modalOverlay dialogOverlay" onClick={() => setErrorDialog('')}>
+          <section
+            className="appDialog"
+            role="alertdialog"
+            aria-modal="true"
+            aria-label="Error"
+            onClick={e => e.stopPropagation()}
+          >
+            <div className="appDialogIcon"><AlertOctagon /></div>
+            <h2>Cannot generate terrain</h2>
+            <p>{errorDialog}</p>
+            <div className="updateActions">
+              <button className="updateReload" onClick={() => setErrorDialog('')}>OK</button>
+            </div>
+          </section>
+        </div>
+      )}
+
+      {confirmReset && (
+        <div className="modalOverlay dialogOverlay" onClick={() => setConfirmReset(false)}>
+          <section
+            className="appDialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="reset-dialog-title"
+            onClick={e => e.stopPropagation()}
+          >
+            <div className="appDialogIcon"><RefreshCw /></div>
+            <h2 id="reset-dialog-title">Reset generation?</h2>
+            <p>
+              This stops the current run and permanently deletes every generated terrain chunk —
+              including the copies saved in the browser cache. Are you sure you want to continue?
+            </p>
+            <div className="updateActions">
+              <button className="updateCancel" onClick={() => setConfirmReset(false)}>Cancel</button>
+              <button className="updateReload" onClick={doReset}>Yes, reset</button>
+            </div>
+          </section>
+        </div>
+      )}
 
       {viewer && (
         <TerrainView
