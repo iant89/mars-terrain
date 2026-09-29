@@ -1,7 +1,7 @@
 // Region selection for "save chunks around a starting position" exports.
 //
 // The planet is partitioned into 6 faces of N×N tiles (the same F#-x-y grid as
-// the .mars headers). A region is an angular disc around a lat/lon starting
+// the .fet headers). A region is an angular disc around a lat/lon starting
 // position: tiles whose center lies within `radiusTiles` tile-widths of the
 // start are kept, everything else is discarded (never generated).
 //
@@ -142,7 +142,6 @@ export function planRegion(nPerFace: number, spec: RegionSpec): RegionPlan {
   const radius = Math.max(0, spec.radiusTiles);
   const centerDir = latLonToVec(spec.lat, spec.lon);
 
-  // Face whose plane contains the start direction (dominant axis).
   const ax = Math.abs(centerDir.x), ay = Math.abs(centerDir.y), az = Math.abs(centerDir.z);
   let face: number;
   if (ax >= ay && ax >= az) face = centerDir.x >= 0 ? 0 : 1;
@@ -154,8 +153,6 @@ export function planRegion(nPerFace: number, spec: RegionSpec): RegionPlan {
   const cy = clampInt(Math.round(((cv + 1) / 2) * N - 0.5), 0, N - 1);
   const center: RegionTile = { face, x: cx, y: cy };
 
-  // Angular width of one tile at the center (take the larger of the u/v steps
-  // so the radius is never underestimated).
   const tu = tileUV(N, cx), tv = tileUV(N, cy);
   const c0 = faceDirVec(face, tu, tv);
   const du = angularDistance(c0, faceDirVec(face, tu + 2 / N, tv));
@@ -164,9 +161,6 @@ export function planRegion(nPerFace: number, spec: RegionSpec): RegionPlan {
   const maxAngle = Math.min(Math.PI, radius * tileAngleRad);
   const radiusKm = (radius * tileAngleRad * MARS_RADIUS_M) / 1000;
 
-  // Candidate boxes: parameter-space position of the start on every face, with
-  // a half-width that covers radiusTiles after cube-sphere distortion (~2×)
-  // plus a margin. Each candidate is then verified by exact angular distance.
   const half = Math.ceil(radius * 2) + 2;
   const tiles: ({ face: number; x: number; y: number; dist: number })[] = [];
 
@@ -174,7 +168,7 @@ export function planRegion(nPerFace: number, spec: RegionSpec): RegionPlan {
     const { u: gu, v: gv } = faceUV(f, centerDir);
     if (!Number.isFinite(gu) || !Number.isFinite(gv)) continue;
     const reach = 1 + (2 * half) / N;
-    if (Math.abs(gu) > reach || Math.abs(gv) > reach) continue; // face too far away
+    if (Math.abs(gu) > reach || Math.abs(gv) > reach) continue;
     const gx = ((gu + 1) / 2) * N - 0.5;
     const gy = ((gv + 1) / 2) * N - 0.5;
     const x0 = Math.max(0, Math.floor(gx - half)), x1 = Math.min(N - 1, Math.ceil(gx + half));
@@ -183,13 +177,11 @@ export function planRegion(nPerFace: number, spec: RegionSpec): RegionPlan {
       for (let x = x0; x <= x1; x++) {
         const d = faceDirVec(f, tileUV(N, x), tileUV(N, y));
         const dist = angularDistance(centerDir, d);
-        // The spawn tile is always kept, even at radius 0.
         if (dist <= maxAngle || (f === face && x === cx && y === cy)) tiles.push({ face: f, x, y, dist });
       }
     }
   }
 
-  // Nearest-first (the spawn tile leads), deterministic tie-break in grid order.
   tiles.sort((a, b) => (a.dist - b.dist) || (a.face - b.face) || (a.y - b.y) || (a.x - b.x));
 
   return {
