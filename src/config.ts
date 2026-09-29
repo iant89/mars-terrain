@@ -39,7 +39,7 @@ export type Config = {
   // face-center approximation for a single representative spacing value.
   sourceSpacingM: number;          // meters between adjacent vertices
   sourceDepthM: number;            // MOLA elevation samples are stored in whole metres
-  // Each .mars blob = 24 byte header + heights (Float32 * res^2) + materials (Uint8 * res^2)
+  // Each .fet blob = 24 byte header + heights (Float32 * res^2) + materials (Uint8 * res^2)
   bytesPerChunk: number;
   estimatedTotalBytes: number;     // bytesPerChunk * totalChunks
   practical: boolean;              // true if this preset can reasonably run in a browser
@@ -75,23 +75,11 @@ export function deriveConfig(preset: ChunkPreset): Config {
   };
 }
 
-export function formatBytes(n: number): string {
+export function formatBytes(n: number): number extends never ? string : string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 ** 2) return `${(n / 1024).toFixed(1)} KB`;
   if (n < 1024 ** 3) return `${(n / 1024 ** 2).toFixed(1)} MB`;
   if (n < 1024 ** 4) return `${(n / 1024 ** 3).toFixed(2)} GB`;
   if (n < 1024 ** 5) return `${(n / 1024 ** 4).toFixed(2)} TB`;
   return `${(n / 1024 ** 5).toFixed(2)} PB`;
-}
-
-export function formatMeters(m: number): string {
-  if (m >= 1000) return `${(m / 1000).toFixed(2)} km`;
-  if (m >= 1) return `${m.toFixed(2)} m`;
-  if (m >= 0.01) return `${(m * 100).toFixed(2)} cm`;
-  return `${(m * 1000).toFixed(2)} mm`;
-}
-
-// Number formatting with thousand separators.
-export function fmt(n: number): string {
-  return n.toLocaleString('en-US');
 }
