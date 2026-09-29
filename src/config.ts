@@ -33,10 +33,6 @@ export type Config = {
   resolution: number;              // vertices per chunk edge (fixed at CHUNK_RESOLUTION)
   verticesPerChunk: number;        // resolution^2
   cellsPerChunkEdge: number;       // resolution - 1
-  // Approximate ground-sample distance at the chunk level.
-  // On a cube-sphere face, the projected edge length at the face center is
-  // roughly (2/√3) * R ≈ 1.1547 * R, while near corners it's ~R. We use the
-  // face-center approximation for a single representative spacing value.
   sourceSpacingM: number;          // meters between adjacent vertices
   sourceDepthM: number;            // MOLA elevation samples are stored in whole metres
   // Each .fet blob = 24 byte header + heights (Float32 * res^2) + materials (Uint8 * res^2)
@@ -52,12 +48,10 @@ export function deriveConfig(preset: ChunkPreset): Config {
   const resolution = CHUNK_RESOLUTION;
   const verticesPerChunk = resolution * resolution;
   const cellsPerChunkEdge = resolution - 1;
-  // Vertices span the full face edge -> spacing ~ face_edge_length / (N*cellsPerChunkEdge)
-  // Face edge on the cube face (tangent plane): s = (2/sqrt(3)) * R  (central spacing)
   const faceEdgeM = (2 / Math.sqrt(3)) * MARS_RADIUS_M;
   const sourceSpacingM = faceEdgeM / (n * cellsPerChunkEdge);
   const sourceDepthM = 1;
-  const bytesPerChunk = 24 + verticesPerChunk * 4 + verticesPerChunk; // header + Float32 elevations + Uint8 materials
+  const bytesPerChunk = 24 + verticesPerChunk * 4 + verticesPerChunk;
   const estimatedTotalBytes = bytesPerChunk * totalChunks;
   return {
     preset,
@@ -75,11 +69,22 @@ export function deriveConfig(preset: ChunkPreset): Config {
   };
 }
 
-export function formatBytes(n: number): number extends never ? string : string {
+export function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 ** 2) return `${(n / 1024).toFixed(1)} KB`;
   if (n < 1024 ** 3) return `${(n / 1024 ** 2).toFixed(1)} MB`;
   if (n < 1024 ** 4) return `${(n / 1024 ** 3).toFixed(2)} GB`;
   if (n < 1024 ** 5) return `${(n / 1024 ** 4).toFixed(2)} TB`;
   return `${(n / 1024 ** 5).toFixed(2)} PB`;
+}
+
+export function formatMeters(m: number): string {
+  if (m >= 1000) return `${(m / 1000).toFixed(2)} km`;
+  if (m >= 1) return `${m.toFixed(2)} m`;
+  if (m >= 0.01) return `${(m * 100).toFixed(2)} cm`;
+  return `${(m * 1000).toFixed(2)} mm`;
+}
+
+export function fmt(n: number): string {
+  return n.toLocaleString('en-US');
 }
