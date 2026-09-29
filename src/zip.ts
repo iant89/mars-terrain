@@ -1,4 +1,4 @@
-// Minimal ZIP (STORE) writer for packaging generated .mars tiles in-browser.
+// Minimal ZIP (STORE) writer for packaging generated .fet tiles in-browser.
 //
 // Archives are composed with the Blob constructor, so entry payloads are
 // referenced in place instead of being copied through JS memory. STORE
@@ -160,9 +160,7 @@ export function buildZipBlob(entries: ZipEntry[], modDate: Date = new Date()): B
     cv.setUint32(20, size, true);
     cv.setUint32(24, size, true);
     cv.setUint16(28, nameBytes.length, true);
-    // extra field length (30), comment length (32) stay 0
     cv.setUint16(34, 0, true); // disk number start
-    // internal attrs (36), external attrs (38) stay 0
     cv.setUint32(42, offset, true); // relative offset of local header
     cd.set(nameBytes, 46);
     central.push(cd);
