@@ -1,12 +1,12 @@
 /// <reference lib="webworker" />
 import { fromBlob, fromUrl, type GeoTIFF, type GeoTIFFImage } from 'geotiff';
 import { MARS_RADIUS_M } from './config';
+import { FET_MAGIC, FET_VERSION, decodeFetTile, encodeFetTile } from './fet';
 import { cacheTerrainTile, clearCachedTerrainTiles, getCachedTerrainTile } from './terrain-cache';
 import { crc32Init, crc32Update, crc32Digest } from './zip';
 
 const ctx = self as unknown as DedicatedWorkerGlobalScope;
-const DEM_CACHE_VERSION = 'mola-v2';
-const HEADER_BYTES = 24; // six little-endian uint32 values in the .mars header
+const DEM_CACHE_VERSION = 'fet-v1';
 
 type Vec3 = { x: number; y: number; z: number };
 type RasterValues = ArrayLike<number> & { width: number; height: number };
@@ -310,18 +310,8 @@ function makeCacheKey(face: number, cx: number, cy: number, res: number, chunks:
 async function decodeCachedTile(blob: Blob, face: number, cx: number, cy: number, res: number): Promise<{
   heights: Float32Array; materials: Uint8Array;
 } | null> {
-  const expectedBytes = HEADER_BYTES + res * res * 5;
-  if (blob.size !== expectedBytes) return null;
   const buffer = await blob.arrayBuffer();
-  const view = new DataView(buffer);
-  if (view.getUint32(0, true) !== 0x4d415253 || view.getUint32(4, true) !== 1 ||
-      view.getUint32(8, true) !== face || view.getUint32(12, true) !== cx ||
-      view.getUint32(16, true) !== cy || view.getUint32(20, true) !== res) return null;
-  const heights = new Float32Array(res * res);
-  const heightBytes = new Uint8Array(buffer, HEADER_BYTES, res * res * 4);
-  new Uint8Array(heights.buffer).set(heightBytes);
-  const materials = new Uint8Array(buffer, HEADER_BYTES + res * res * 4, res * res).slice();
-  return { heights, materials };
+  return decodeFetTile(buffer, face, cx, cy, res);
 }
 
 async function generate(message: any, token: number): Promise<void> {
@@ -353,17 +343,13 @@ async function generate(message: any, token: number): Promise<void> {
   if (token !== generationRevision) return;
   const { heights, materials } = await sampleTile(id, token, face, cx, cy, res, chunks);
   if (token !== generationRevision) return;
-  const header = new Uint32Array([0x4d415253, 1, face, cx, cy, res]);
+  const header = new Uint32Array([FET_MAGIC, FET_VERSION, face, cx, cy, res]);
   let crcState = crc32Init();
   crcState = crc32Update(crcState, new Uint8Array(header.buffer));
   crcState = crc32Update(crcState, new Uint8Array(heights.buffer));
   crcState = crc32Update(crcState, materials);
   const crc = crc32Digest(crcState);
-  const blob = new Blob([
-    header.buffer as ArrayBuffer,
-    heights.buffer as ArrayBuffer,
-    materials.buffer as ArrayBuffer,
-  ], { type: 'application/octet-stream' });
+  const blob = encodeFetTile(face, cx, cy, res, heights, materials);
   if (!cacheWriteDisabled) {
     try {
       await cacheTerrainTile({ key: cacheKey, blob, crc });
@@ -387,7 +373,7 @@ ctx.onmessage = event => {
   }
   if (message.type === 'clear-cache') {
     // Reset cleanup: invalidate any in-flight tile and wipe every generated
-    // .mars file persisted in the browser cache.
+    // .fet file persisted in the browser cache.
     generationRevision++;
     cacheReadDisabled = false;
     cacheWriteDisabled = false;
