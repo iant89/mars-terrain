@@ -1,6 +1,6 @@
 // Interactive 3D terrain renderer.
 //
-// Generated .mars tiles are drawn on a real sphere (planet-centered metres,
+// Generated .fet tiles are drawn on a real sphere (planet-centered metres,
 // see terrain.ts) so the view is a planet, not a tangent patch. The camera
 // orbits that planet: drag to pan at a constant altitude, wheel to zoom.
 // Close-up cruise altitude is 1 km; zooming out reveals the whole globe.

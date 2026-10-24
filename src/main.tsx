@@ -7,6 +7,7 @@ import {
 } from 'lucide-react';
 import * as THREE from 'three';
 import { Chunk } from './types';
+import { FET_EXTENSION } from './fet';
 import { TerrainViewer } from './renderer';
 import { TileRef, angleBetween, tileCenterDir } from './terrain';
 import {
@@ -883,7 +884,7 @@ function App() {
     if (!c.blob) return;
     const a = document.createElement('a');
     a.href = URL.createObjectURL(c.blob);
-    a.download = `${c.id}.mars`;
+    a.download = `${c.id}${FET_EXTENSION}`;
     a.click();
     URL.revokeObjectURL(a.href);
   }
@@ -913,7 +914,7 @@ function App() {
       const entries: ZipEntry[] = [];
       for (const c of ready) {
         const blob = c.blob!;
-        entries.push({ name: `${c.id}.mars`, blob, crc32: typeof c.crc === 'number' ? c.crc : await crc32OfBlob(blob) });
+        entries.push({ name: `${c.id}${FET_EXTENSION}`, blob, crc32: typeof c.crc === 'number' ? c.crc : await crc32OfBlob(blob) });
       }
       const parts = planZipParts(entries);
       // The name recorded when the queue was built — always matches the tiles
@@ -1292,7 +1293,7 @@ function App() {
           {cfg.resolution} × {cfg.resolution} vertices per chunk ·
           {' '}{formatMeters(cfg.sourceSpacingM)} source spacing ·
           {' '}{formatMeters(cfg.sourceDepthM)} vertical step ·
-          {' '}MARS binary · preset <b>{cfg.preset.label}</b>
+          {' '}FET binary · preset <b>{cfg.preset.label}</b>
         </span>
       </section>
 

@@ -48,7 +48,7 @@ export type LocalPoint = { x: number; y: number; z: number };
  *
  * The planet frame is geographic: +X at 0° N 0° E, +Y at the north pole and
  * +Z at 0° N 90° E — that is exactly what `lon = atan2(z, x)` means for the
- * cube-sphere tiles, the `.mars` headers and every lat/lon readout. In that
+ * cube-sphere tiles, the `.fet` headers and every lat/lon readout. In that
  * frame the (east, north, up) triad is *left*-handed, so handing those
  * coordinates straight to a right-handed renderer draws a mirror image of the
  * planet: with north up, east ends up on the left of the screen. Mirrored
